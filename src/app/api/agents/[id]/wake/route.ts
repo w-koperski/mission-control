@@ -39,6 +39,19 @@ export async function POST(
       customMessage ||
       `Wake up check-in for ${agent.name}. Please review assigned tasks and notifications.`
 
+    // Try to send via local clawdbot (fallback for gateways that don't expose sessions.send RPC).
+    // Prefer clawdbot/local call because some deployments implement session delivery there.
+    const clawdbotCmd = `sessions_send("${agent.session_key}", ${JSON.stringify(message)})`
+    try {
+      const cb = await runClawdbot(['-c', clawdbotCmd], { timeoutMs: 10000 })
+      if (cb && cb.code === 0) {
+        db_helpers.updateAgentStatus(agent.name, 'idle', 'Manual wake', workspaceId)
+        return NextResponse.json({ success: true, session_key: agent.session_key, stdout: cb.stdout.trim() })
+      }
+    } catch (cbErr) {
+      logger.warn({ err: cbErr }, 'clawdbot fallback failed, will try gateway RPC')
+    }
+
     // Correct form per docs (https://docs.openclaw.ai/cli/gateway.md):
     //   openclaw gateway call sessions.send --params '{"session":"...","message":"..."}'
     // The legacy 'gateway sessions_send' subcommand does not exist in OpenClaw.
