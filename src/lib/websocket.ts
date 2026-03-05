@@ -269,8 +269,19 @@ export function useWebSocket() {
     switch (message.type) {
       case 'session_update':
         if (message.data?.sessions) {
-          setSessions(message.data.sessions.map((session: any, index: number) => ({
-            id: session.key || `session-${index}`,
+          const rawSessions: any[] = Array.isArray(message.data.sessions)
+            ? message.data.sessions
+            : Object.values(message.data.sessions)
+          const sessionMap = new Map<string, { id: string; session: any }>()
+          rawSessions.forEach((session: any, index: number) => {
+            const id = session.key || `session-${index}`
+            const existing = sessionMap.get(id)
+            if (!existing || (session.lastActivity || 0) >= (existing.session.lastActivity || 0)) {
+              sessionMap.set(id, { id, session })
+            }
+          })
+          setSessions(Array.from(sessionMap.values()).map(({ id, session }) => ({
+            id,
             key: session.key || '',
             kind: session.kind || 'unknown',
             age: session.age || '',
@@ -421,8 +432,19 @@ export function useWebSocket() {
         // Tick event contains snapshot data
         const snapshot = frame.payload?.snapshot
         if (snapshot?.sessions) {
-          setSessions(snapshot.sessions.map((session: any, index: number) => ({
-            id: session.key || `session-${index}`,
+          const rawSessions: any[] = Array.isArray(snapshot.sessions)
+            ? snapshot.sessions
+            : Object.values(snapshot.sessions)
+          const sessionMap = new Map<string, { id: string; session: any }>()
+          rawSessions.forEach((session: any, index: number) => {
+            const id = session.key || `session-${index}`
+            const existing = sessionMap.get(id)
+            if (!existing || (session.updatedAt || 0) >= (existing.session.updatedAt || 0)) {
+              sessionMap.set(id, { id, session })
+            }
+          })
+          setSessions(Array.from(sessionMap.values()).map(({ id, session }) => ({
+            id,
             key: session.key || '',
             kind: session.kind || 'unknown',
             age: formatAge(session.updatedAt),

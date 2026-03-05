@@ -131,7 +131,7 @@ export function GitHubSyncPanel() {
       const res = await fetch('/api/agents')
       if (res.ok) {
         const data = await res.json()
-        setAgents((data.agents || []).map((a: any) => ({ name: a.name })))
+        setAgents((data.agents || []).filter((a: any) => a.name !== 'main').map((a: any) => ({ name: a.name })))
       }
     } catch { /* ignore */ }
   }, [])
