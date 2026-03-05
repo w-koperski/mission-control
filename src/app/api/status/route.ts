@@ -374,9 +374,63 @@ async function getGatewayStatus() {
 }
 
 async function getAvailableModels() {
-  // This would typically query the gateway or config files
-  // Model catalog is the single source of truth
+  // Model catalog is the single source of truth, but restrict to models configured in OpenClaw when available
   const models = [...MODEL_CATALOG]
+
+  let allowedNames: Set<string> | null = null
+  try {
+    if (config.openclawConfigPath) {
+      const raw = await runCommand('cat', [config.openclawConfigPath], { timeoutMs: 2000 }).then(r => r.stdout).catch(() => null)
+      if (raw) {
+        try {
+          const cfg = JSON.parse(raw)
+          allowedNames = new Set<string>()
+
+          // Collect from agents.defaults.models keys
+          if (cfg?.agents?.defaults?.models && typeof cfg.agents.defaults.models === 'object') {
+            for (const k of Object.keys(cfg.agents.defaults.models)) allowedNames.add(String(k))
+          }
+
+          // Collect primary/fallbacks from agents.defaults.model
+          if (cfg?.agents?.defaults?.model) {
+            const dmodel = cfg.agents.defaults.model
+            if (typeof dmodel.primary === 'string') allowedNames.add(dmodel.primary)
+            if (Array.isArray(dmodel.fallbacks)) dmodel.fallbacks.forEach((f: string) => allowedNames!.add(f))
+          }
+
+          // Collect from agents.list entries
+          if (Array.isArray(cfg?.agents?.list)) {
+            for (const a of cfg.agents.list) {
+              if (a?.model) {
+                // model.primary may be nested
+                if (typeof a.model.primary === 'string') allowedNames.add(a.model.primary)
+                if (typeof a.model.primary === 'object' && typeof a.model.primary.primary === 'string') allowedNames.add(a.model.primary.primary)
+                if (Array.isArray(a.model.fallbacks)) a.model.fallbacks.forEach((f: string) => allowedNames!.add(f))
+              }
+            }
+          }
+
+          // Also collect any top-level models.providers entries
+          if (cfg?.models?.providers && typeof cfg.models.providers === 'object') {
+            for (const provider of Object.values(cfg.models.providers)) {
+              if (provider && typeof provider === 'object') {
+                for (const k of Object.keys(provider)) allowedNames.add(String(k))
+              }
+            }
+          }
+
+          // If we collected nothing, mark allowedNames as null to fall back to default behavior
+          if (allowedNames.size === 0) allowedNames = null
+        } catch (e) {
+          logger.error({ err: e }, 'Failed to parse openclaw config for models')
+          allowedNames = null
+        }
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, 'Error reading openclaw config')
+    allowedNames = null
+  }
 
   try {
     // Check which Ollama models are available locally
@@ -406,6 +460,19 @@ async function getAvailableModels() {
     })
   } catch (error) {
     logger.error({ err: error }, 'Error checking Ollama models')
+  }
+
+  // If we have an allowlist from OpenClaw config, filter models to only those present
+  if (allowedNames) {
+    const filtered = models.filter(m => {
+      if (!m || !m.name) return false
+      if (allowedNames!.has(m.name)) return true
+      // sometimes MODEL_CATALOG uses provider-prefixed names, allow matching by short alias
+      const short = (m.name as string).split('/').pop()
+      if (short && allowedNames!.has(short)) return true
+      return false
+    })
+    return filtered
   }
 
   return models
