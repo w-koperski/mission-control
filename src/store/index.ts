@@ -752,11 +752,17 @@ export const useMissionControl = create<MissionControlStore>()(
         return { chatMessages: messages, conversations }
       }),
     replacePendingMessage: (tempId, message) =>
-      set((state) => ({
-        chatMessages: state.chatMessages.map(m =>
-          m.id === tempId ? { ...message, pendingStatus: 'sent' } : m
-        ),
-      })),
+      set((state) => {
+        // If the real message was already added (e.g. by websocket/polling), just remove the pending one
+        if (message.id > 0 && state.chatMessages.some(m => m.id === message.id)) {
+          return { chatMessages: state.chatMessages.filter(m => m.id !== tempId) }
+        }
+        return {
+          chatMessages: state.chatMessages.map(m =>
+            m.id === tempId ? { ...message, pendingStatus: 'sent' } : m
+          ),
+        }
+      }),
     updatePendingMessage: (tempId, updates) =>
       set((state) => ({
         chatMessages: state.chatMessages.map(m =>
