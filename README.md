@@ -87,7 +87,7 @@ Monitor agent status, spawn new sessions, view heartbeats, and manage the full a
 Kanban board with six columns (inbox → backlog → todo → in-progress → review → done), drag-and-drop, priority levels, assignments, and threaded comments.
 
 ### Real-time Monitoring
-Live activity feed, session inspector, and log viewer with filtering. WebSocket connection to OpenClaw gateway for instant event delivery.
+Live activity feed, session inspector, and log viewer with filtering. WebSocket connection to OpenClaw gateway for instant event delivery. When the gateway is only locally reachable, use **proxy mode** (see below).
 
 ### Cost Tracking
 Token usage dashboard with per-model breakdowns, trend charts, and cost analysis powered by Recharts.
@@ -384,6 +384,8 @@ See [`.env.example`](.env.example) for the complete list. Key variables:
 | `OPENCLAW_TOOLS_PROFILE` | No | Tools profile for `sessions_spawn` (recommended: `coding`) |
 | `NEXT_PUBLIC_GATEWAY_TOKEN` | No | Browser-side gateway auth token (must use `NEXT_PUBLIC_` prefix) |
 | `NEXT_PUBLIC_GATEWAY_CLIENT_ID` | No | Gateway UI client ID for websocket handshake (default: `openclaw-control-ui`) |
+| `GATEWAY_PROXY_MODE` | No | Set to `1` to enable server-side gateway proxy (see below) |
+| `NEXT_PUBLIC_GATEWAY_PROXY_MODE` | No | Must match `GATEWAY_PROXY_MODE` so the browser switches transport |
 | `OPENCLAW_MEMORY_DIR` | No | Memory browser root (see note below) |
 | `MC_CLAUDE_HOME` | No | Path to `~/.claude` directory (default: `~/.claude`) |
 | `MC_TRUSTED_PROXIES` | No | Comma-separated trusted proxy IPs for XFF parsing |
@@ -399,6 +401,48 @@ See [`.env.example`](.env.example) for the complete list. Key variables:
 > ```
 > OPENCLAW_MEMORY_DIR=/home/you/clawd-agents
 > ```
+
+### Local-Gateway-Only (Proxy Mode)
+
+By default the browser opens a direct WebSocket to the OpenClaw gateway
+(`ws://OPENCLAW_GATEWAY_HOST:OPENCLAW_GATEWAY_PORT`).  If the gateway is
+bound to `127.0.0.1` and not publicly reachable from the browser you can
+enable **proxy mode**, which routes all gateway interactions through the
+Mission Control server:
+
+```
+# .env
+GATEWAY_PROXY_MODE=1
+NEXT_PUBLIC_GATEWAY_PROXY_MODE=1
+```
+
+| Aspect | Direct WebSocket (default) | Proxy Mode |
+|--------|---------------------------|------------|
+| Transport | Browser → Gateway (WS) | Browser → Server (SSE/HTTP) → Gateway (WS) |
+| Gateway exposed publicly? | Required | Not required |
+| Allowed gateway methods | All (browser-controlled) | Allowlisted subset only |
+
+**Allowed proxy methods** (enforced server-side):
+
+| Method | Role required |
+|--------|---------------|
+| `ping` | viewer |
+| `status` | viewer |
+| `models.list` | viewer |
+| `sessions.list` | viewer |
+| `sessions.send` | operator |
+| `sessions.spawn` | operator |
+
+Any request for a method not in the allowlist is rejected with HTTP 403.
+
+**How it works:**
+
+1. The server maintains a singleton WebSocket to the gateway.
+2. `POST /api/gateway-proxy` — proxies a single method call (request/response).
+3. `GET /api/gateway-proxy/stream` — SSE stream that relays gateway broadcast events to the browser.
+4. The browser-side `useGatewayProxyStream` hook replaces the direct `useWebSocket` when `NEXT_PUBLIC_GATEWAY_PROXY_MODE=1`.
+
+Both `GATEWAY_PROXY_MODE` and `NEXT_PUBLIC_GATEWAY_PROXY_MODE` must be set to `1` so the server-side route is activated and the browser switches to SSE transport.
 
 ### Workspace Creation Flow
 
