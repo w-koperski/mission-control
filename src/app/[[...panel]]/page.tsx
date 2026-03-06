@@ -45,7 +45,7 @@ import { useMissionControl } from '@/store'
 export default function Home() {
   const router = useRouter()
   const { connect } = useWebSocket()
-  const { activeTab, setActiveTab, setCurrentUser, setDashboardMode, setGatewayAvailable, setSubscription, setUpdateAvailable, liveFeedOpen, toggleLiveFeed } = useMissionControl()
+  const { activeTab, setActiveTab, setCurrentUser, setDashboardMode, setGatewayAvailable, setSubscription, setUpdateAvailable, liveFeedOpen, toggleLiveFeed, setAvailableModels } = useMissionControl()
 
   // Sync URL → Zustand activeTab
   const pathname = usePathname()
@@ -72,6 +72,15 @@ export default function Home() {
         return null
       })
       .then(data => { if (data?.user) setCurrentUser(data.user) })
+      .catch(() => {})
+
+    // Fetch and populate available models (includes OpenClaw autodetected models)
+    fetch('/api/status?action=models')
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        const models = Array.isArray(data?.models) ? data.models : []
+        if (models.length > 0) setAvailableModels(models)
+      })
       .catch(() => {})
 
     // Check for available updates
@@ -128,7 +137,7 @@ export default function Home() {
         const wsUrl = explicitWsUrl || `${gatewayProto}://${gatewayHost}:${gatewayPort}`
         connect(wsUrl, wsToken)
       })
-  }, [connect, pathname, router, setCurrentUser, setDashboardMode, setGatewayAvailable, setSubscription, setUpdateAvailable])
+  }, [connect, pathname, router, setCurrentUser, setDashboardMode, setGatewayAvailable, setSubscription, setUpdateAvailable, setAvailableModels])
 
   if (!isClient) {
     return (
