@@ -59,6 +59,10 @@ const CALL_TIMEOUT_MS = 10_000
  * - Uses `wss://` when `OPENCLAW_GATEWAY_PROTOCOL` is set to `wss` or `https`,
  *   or when the gateway host is not a local/loopback address.
  * - Defaults to `ws://` for loopback/localhost hosts.
+ *
+ * IMPORTANT: Do NOT set OPENCLAW_GATEWAY_HOST to `0.0.0.0`.  That address
+ * is a bind wildcard — it is valid for `listen()` but not for outbound
+ * connections.  Use `127.0.0.1` (or the specific interface IP) instead.
  */
 function buildGatewayWsUrl(host: string, port: number): string {
   const explicitProtocol = process.env.OPENCLAW_GATEWAY_PROTOCOL || ''
@@ -266,11 +270,21 @@ let _instance: GatewayProxyManager | null = null
 /**
  * Returns (and lazily creates) the singleton GatewayProxyManager.
  *
+ * On first call, automatically starts the connection to the gateway and
+ * emits a startup log so deployment issues are visible immediately.
+ *
  * Callers should check config.gatewayProxyMode before using this.
  */
 export function getGatewayProxyManager(): GatewayProxyManager {
   if (!_instance) {
     _instance = new GatewayProxyManager()
+    // Eagerly start the connection on first access so health problems are
+    // surfaced at startup rather than only when the first request arrives.
+    logger.info(
+      { host: config.gatewayHost, port: config.gatewayPort },
+      '[gateway-proxy] Proxy mode active — initiating gateway connection',
+    )
+    _instance.connect()
   }
   return _instance
 }

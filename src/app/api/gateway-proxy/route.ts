@@ -7,6 +7,11 @@ import {
   OPERATOR_GATEWAY_METHODS,
 } from '@/lib/gateway-proxy'
 import { logger } from '@/lib/logger'
+import { mutationLimiter, readLimiter, extractClientIp } from '@/lib/rate-limit'
+import { logAuditEvent } from '@/lib/db'
+
+// Maximum accepted request body size (bytes) — prevents oversized gateway payloads.
+const MAX_BODY_BYTES = 64 * 1024 // 64 KiB
 
 /**
  * POST /api/gateway-proxy
@@ -23,6 +28,9 @@ import { logger } from '@/lib/logger'
  *  - Caller must be authenticated (viewer+ for read-only methods,
  *    operator+ for mutating methods).
  *  - Method name is validated against ALLOWED_GATEWAY_METHODS allowlist.
+ *  - Request body is limited to MAX_BODY_BYTES.
+ *  - Mutating calls are rate-limited (mutationLimiter) and audit-logged.
+ *  - Read-only calls are rate-limited (readLimiter).
  */
 export async function POST(request: NextRequest) {
   if (!config.gatewayProxyMode) {
@@ -35,9 +43,22 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: auth.error }, { status: auth.status })
   }
 
+  // Enforce request body size limit before parsing.
+  // Check Content-Length header first (fast path) then verify actual body size
+  // as a defence-in-depth measure — Content-Length can be absent or spoofed.
+  const contentLength = Number(request.headers.get('content-length') || '0')
+  if (contentLength > MAX_BODY_BYTES) {
+    return NextResponse.json({ error: 'Request body too large' }, { status: 413 })
+  }
+
   let body: { method?: unknown; params?: unknown }
   try {
-    body = await request.json()
+    const raw = await request.text()
+    // Defence-in-depth: re-check actual body length in case Content-Length was missing/wrong
+    if (raw.length > MAX_BODY_BYTES) {
+      return NextResponse.json({ error: 'Request body too large' }, { status: 413 })
+    }
+    body = JSON.parse(raw)
   } catch {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
   }
@@ -55,14 +76,37 @@ export async function POST(request: NextRequest) {
     )
   }
 
+  // Apply appropriate rate limit based on method type
+  const isMutating = OPERATOR_GATEWAY_METHODS.has(method)
+  const rateCheck = isMutating ? mutationLimiter(request) : readLimiter(request)
+  if (rateCheck) return rateCheck
+
   // Mutating methods additionally require operator role
-  if (OPERATOR_GATEWAY_METHODS.has(method)) {
+  if (isMutating) {
     const operatorAuth = requireRole(request, 'operator')
     if ('error' in operatorAuth) {
       return NextResponse.json(
         { error: operatorAuth.error },
         { status: operatorAuth.status },
       )
+    }
+  }
+
+  // Audit log mutating gateway calls before execution so the attempt is recorded
+  // even if the gateway call itself fails.
+  if (isMutating) {
+    try {
+      logAuditEvent({
+        action: `gateway_proxy.${method}`,
+        actor: auth.user.username,
+        actor_id: auth.user.id,
+        target_type: 'gateway',
+        detail: { method, hasParams: params !== undefined },
+        ip_address: extractClientIp(request),
+        user_agent: request.headers.get('user-agent') ?? undefined,
+      })
+    } catch (auditErr) {
+      logger.warn({ err: auditErr }, '[gateway-proxy] Audit log failed')
     }
   }
 

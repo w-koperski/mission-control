@@ -440,9 +440,29 @@ Any request for a method not in the allowlist is rejected with HTTP 403.
 1. The server maintains a singleton WebSocket to the gateway.
 2. `POST /api/gateway-proxy` — proxies a single method call (request/response).
 3. `GET /api/gateway-proxy/stream` — SSE stream that relays gateway broadcast events to the browser.
-4. The browser-side `useGatewayProxyStream` hook replaces the direct `useWebSocket` when `NEXT_PUBLIC_GATEWAY_PROXY_MODE=1`.
+4. `GET /api/gateway-proxy/health` — connection health/readiness check.
+5. The browser-side `useGatewayProxyStream` hook replaces the direct `useWebSocket` when `NEXT_PUBLIC_GATEWAY_PROXY_MODE=1`.
 
 Both `GATEWAY_PROXY_MODE` and `NEXT_PUBLIC_GATEWAY_PROXY_MODE` must be set to `1` so the server-side route is activated and the browser switches to SSE transport.
+
+**Production setup (Mission Control public via Cloudflare/reverse proxy, gateway local-only):**
+
+```bash
+# Gateway: bind to loopback only — not exposed to the internet
+openclaw gateway start --bind 127.0.0.1 --port 18789
+
+# Mission Control: serve publicly via Caddy / nginx / Cloudflare Tunnel
+# .env
+OPENCLAW_GATEWAY_HOST=127.0.0.1   # loopback — NOT 0.0.0.0
+OPENCLAW_GATEWAY_PORT=18789
+GATEWAY_PROXY_MODE=1
+NEXT_PUBLIC_GATEWAY_PROXY_MODE=1
+# MC_ALLOWED_HOSTS=mc.yourhost.example.com
+```
+
+> **Note:** Do not set `OPENCLAW_GATEWAY_HOST=0.0.0.0`. That is a bind wildcard, not a
+> valid connection target. Use `127.0.0.1` (or the specific interface IP) as the
+> server-side gateway address.
 
 ### Workspace Creation Flow
 
