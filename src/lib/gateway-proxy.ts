@@ -49,6 +49,31 @@ const RECONNECT_BASE_MS = 2_000
 const RECONNECT_MAX_MS = 30_000
 const CALL_TIMEOUT_MS = 10_000
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the WebSocket URL for the server → gateway connection.
+ *
+ * - Uses `wss://` when `OPENCLAW_GATEWAY_PROTOCOL` is set to `wss` or `https`,
+ *   or when the gateway host is not a local/loopback address.
+ * - Defaults to `ws://` for loopback/localhost hosts.
+ */
+function buildGatewayWsUrl(host: string, port: number): string {
+  const explicitProtocol = process.env.OPENCLAW_GATEWAY_PROTOCOL || ''
+  if (explicitProtocol === 'wss' || explicitProtocol === 'https') {
+    return `wss://${host}:${port}`
+  }
+  const isLocal =
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host.toLowerCase() === 'localhost' ||
+    host.toLowerCase().endsWith('.local')
+  const protocol = isLocal ? 'ws' : 'wss'
+  return `${protocol}://${host}:${port}`
+}
+
 interface PendingRequest {
   resolve: (value: unknown) => void
   reject: (reason: Error) => void
@@ -76,7 +101,7 @@ class GatewayProxyManager extends EventEmitter {
     }
 
     this._stopping = false
-    const url = `ws://${config.gatewayHost}:${config.gatewayPort}`
+    const url = buildGatewayWsUrl(config.gatewayHost, config.gatewayPort)
     logger.info({ url }, '[gateway-proxy] Connecting to gateway')
 
     const ws = new WebSocket(url)

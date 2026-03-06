@@ -41,13 +41,8 @@ import { PromoBanner } from '@/components/layout/promo-banner'
 import { useWebSocket } from '@/lib/websocket'
 import { useServerEvents } from '@/lib/use-server-events'
 import { useGatewayProxyStream } from '@/lib/use-gateway-proxy-stream'
+import { GATEWAY_PROXY_MODE } from '@/lib/proxy-config'
 import { useMissionControl } from '@/store'
-
-// When NEXT_PUBLIC_GATEWAY_PROXY_MODE=1 the server proxies all gateway
-// interactions; the browser never opens a direct WebSocket to the gateway.
-const GATEWAY_PROXY_MODE =
-  process.env.NEXT_PUBLIC_GATEWAY_PROXY_MODE === '1' ||
-  process.env.NEXT_PUBLIC_GATEWAY_PROXY_MODE === 'true'
 
 export default function Home() {
   const router = useRouter()

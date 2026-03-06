@@ -15,12 +15,14 @@ import { useEffect, useRef } from 'react'
 import { useMissionControl } from '@/store'
 import { normalizeModel } from '@/lib/utils'
 import { createClientLogger } from '@/lib/client-logger'
+import { GATEWAY_PROXY_MODE } from '@/lib/proxy-config'
 
 const log = createClientLogger('GatewayProxyStream')
 
 const MAX_RECONNECT_ATTEMPTS = 20
 const BASE_RECONNECT_MS = 1_000
 const MAX_RECONNECT_MS = 30_000
+const JITTER_FACTOR = 0.5
 
 export function useGatewayProxyStream() {
   const esRef = useRef<EventSource | null>(null)
@@ -44,10 +46,7 @@ export function useGatewayProxyStream() {
     mountedRef.current = true
 
     // Skip entirely when proxy mode is not enabled
-    if (
-      process.env.NEXT_PUBLIC_GATEWAY_PROXY_MODE !== '1' &&
-      process.env.NEXT_PUBLIC_GATEWAY_PROXY_MODE !== 'true'
-    ) {
+    if (!GATEWAY_PROXY_MODE) {
       return
     }
 
@@ -92,7 +91,7 @@ export function useGatewayProxyStream() {
           return
         }
         const base = Math.min(BASE_RECONNECT_MS * Math.pow(2, attempts), MAX_RECONNECT_MS)
-        const delay = Math.round(base + Math.random() * base * 0.5)
+        const delay = Math.round(base + Math.random() * base * JITTER_FACTOR)
         attemptsRef.current = attempts + 1
         setConnection({ reconnectAttempts: attempts + 1 })
         log.warn(`Reconnecting proxy stream in ${delay}ms (attempt ${attempts + 1})`)
