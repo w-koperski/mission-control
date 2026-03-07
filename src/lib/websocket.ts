@@ -620,6 +620,14 @@ export function useWebSocket() {
           return
         }
 
+        // For normal closures (code 1000) the remote ended the session cleanly
+        // and is expected to accept a new connection immediately.  Reset the
+        // attempt counter so exponential backoff starts from zero again instead
+        // of accumulating toward maxReconnectAttempts.
+        if (event.code === 1000) {
+          reconnectAttemptsRef.current = 0
+        }
+
         // Auto-reconnect with exponential backoff (uses connectRef to avoid stale closure)
         const attempts = reconnectAttemptsRef.current
         if (attempts < maxReconnectAttempts) {

@@ -152,6 +152,13 @@ class GatewayProxyManager extends EventEmitter {
       }
 
       if (!this._stopping) {
+        // For normal closures (code 1000) the gateway ended the session cleanly
+        // and is expected to be available again immediately.  Reset the backoff
+        // counter so we reconnect with the minimum delay instead of waiting an
+        // exponentially increasing time.
+        if (code === 1000) {
+          this.reconnectAttempts = 0
+        }
         this._scheduleReconnect()
       }
     })
