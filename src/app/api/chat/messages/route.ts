@@ -18,6 +18,12 @@ const COORDINATOR_AGENT =
   String(process.env.MC_COORDINATOR_AGENT || process.env.NEXT_PUBLIC_COORDINATOR_AGENT || 'coordinator').trim() ||
   'coordinator'
 
+// Timeouts for agent.wait calls.
+// AGENT_WAIT_MS: how long OpenClaw waits for the agent to complete.
+// AGENT_WAIT_CMD_MS: total shell-command timeout (must be longer than AGENT_WAIT_MS).
+const AGENT_WAIT_MS = 6_000
+const AGENT_WAIT_CMD_MS = 9_000
+
 function parseGatewayJson(raw: string): any | null {
   const trimmed = String(raw || '').trim()
   if (!trimmed) return null
@@ -253,15 +259,19 @@ export async function POST(request: NextRequest) {
           .prepare('SELECT * FROM agents WHERE lower(name) = lower(?) AND workspace_id = ?')
           .get(to, workspaceId) as any
 
-        let sessionKey: string | null = agent?.session_key || null
+        let sessionKey: string | null = null
 
-        // Fallback: derive session from on-disk gateway session stores
+        // Derive session from on-disk gateway session stores.
+        // Keys in those stores have the format "agent:<name>:main" which OpenClaw
+        // uses to identify the target agent.  The session_key column in the DB is a
+        // user-defined label that OpenClaw does not recognise for routing and must
+        // not be used here.
         if (!sessionKey) {
           const sessions = getAllGatewaySessions()
           const match = sessions.find(
             (s) => s.agent.toLowerCase() === String(to).toLowerCase()
           )
-          sessionKey = match?.key || match?.sessionId || null
+          sessionKey = match?.key || null
         }
 
         // Prefer configured openclawId when present, fallback to normalized name
@@ -394,12 +404,12 @@ export async function POST(request: NextRequest) {
                     'call',
                     'agent.wait',
                     '--timeout',
-                    '8000',
+                    String(AGENT_WAIT_CMD_MS - 1000),
                     '--params',
-                    JSON.stringify({ runId: forwardInfo.runId, timeoutMs: 6000 }),
+                    JSON.stringify({ runId: forwardInfo.runId, timeoutMs: AGENT_WAIT_MS }),
                     '--json',
                   ],
-                  { timeoutMs: 9000 }
+                  { timeoutMs: AGENT_WAIT_CMD_MS }
                 )
 
                 const waitPayload = parseGatewayJson(waitResult.stdout)
@@ -477,6 +487,57 @@ export async function POST(request: NextRequest) {
                   { status: 'unknown', runId: forwardInfo.runId }
                 )
               }
+            }
+          }
+
+          // Regular agent conversations (agent_<name> format from the chat panel):
+          // Wait for the agent to complete and store the response so it appears
+          // in the UI immediately via SSE instead of relying on a gateway event
+          // with a possibly-incorrect conversation_id.
+          if (
+            typeof conversation_id === 'string' &&
+            !conversation_id.startsWith('coord:') &&
+            forwardInfo.delivered &&
+            forwardInfo.runId &&
+            typeof to === 'string'
+          ) {
+            try {
+              const waitResult = await runOpenClaw(
+                [
+                  'gateway',
+                  'call',
+                  'agent.wait',
+                  '--timeout',
+                  String(AGENT_WAIT_CMD_MS - 1000),
+                  '--params',
+                  JSON.stringify({ runId: forwardInfo.runId, timeoutMs: AGENT_WAIT_MS }),
+                  '--json',
+                ],
+                { timeoutMs: AGENT_WAIT_CMD_MS }
+              )
+
+              const waitPayload = parseGatewayJson(waitResult.stdout)
+              const waitStatus = String(waitPayload?.status || '').toLowerCase()
+
+              if (waitStatus !== 'error') {
+                const replyText = extractReplyText(waitPayload)
+                if (replyText) {
+                  createChatReply(
+                    db,
+                    workspaceId,
+                    conversation_id,
+                    to,
+                    from,
+                    replyText,
+                    'text',
+                    { status: waitStatus || 'completed', runId: forwardInfo.runId }
+                  )
+                }
+              }
+            } catch {
+              // Non-fatal: if agent.wait fails or times out, the response may
+              // still arrive via a gateway chat.message event later.
+              logger.debug({ runId: forwardInfo.runId }, '[chat] agent.wait timed-out/failed; response will arrive via gateway event if available')
             }
           }
         }
