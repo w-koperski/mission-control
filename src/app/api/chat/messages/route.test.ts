@@ -157,7 +157,7 @@ describe('POST /api/chat/messages — agent.wait for regular conversations', () 
     expect(secondCallArgs).toContain('agent.wait')
   })
 
-  it('includes conversationId in the gateway invoke params', async () => {
+  it('does NOT include conversationId in the gateway invoke params (rejected by OpenClaw)', async () => {
     mockRunOpenClaw
       .mockResolvedValueOnce({ stdout: JSON.stringify({ status: 'accepted', runId: 'run-xyz' }), stderr: '', code: 0 })
       .mockResolvedValueOnce({ stdout: JSON.stringify({ status: 'completed', text: 'hi' }), stderr: '', code: 0 })
@@ -175,7 +175,11 @@ describe('POST /api/chat/messages — agent.wait for regular conversations', () 
     // The --params argument is the JSON payload sent to the gateway
     const paramsIdx = firstCallArgs.indexOf('--params')
     const params = JSON.parse(firstCallArgs[paramsIdx + 1])
-    expect(params.conversationId).toBe('agent_coordinator')
+    // conversationId must NOT be sent — OpenClaw rejects it as an unexpected property
+    expect(params.conversationId).toBeUndefined()
+    // Required fields that must still be present
+    expect(params.message).toContain('hello')
+    expect(params.idempotencyKey).toBeDefined()
   })
 
   it('does NOT call the non-coordinator agent.wait block for coord: conversations', async () => {

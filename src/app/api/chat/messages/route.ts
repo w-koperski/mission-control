@@ -310,9 +310,6 @@ export async function POST(request: NextRequest) {
           try {
             const invokeParams: any = {
               message: `Message from ${from}: ${content}`,
-              // Pass conversation_id so OpenClaw can tag the response event
-              // with the same ID, enabling the UI to match it to the open chat.
-              conversationId: conversation_id,
               idempotencyKey: `mc-${messageId}-${Date.now()}`,
               deliver: false,
             }
