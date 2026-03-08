@@ -80,15 +80,24 @@ function createChatReply(
   })
 }
 
+/**
+ * Extract a human-readable reply string from an openclaw agent.wait payload.
+ *
+ * Fields are checked in priority order — most specific/likely first:
+ *   reply > text > message > response > output (string) > result > content
+ * For a nested `output` object the same priority applies: text > message > content > reply.
+ */
 function extractReplyText(waitPayload: any): string | null {
   if (!waitPayload || typeof waitPayload !== 'object') return null
 
   const directCandidates = [
+    waitPayload.reply,
     waitPayload.text,
     waitPayload.message,
     waitPayload.response,
     waitPayload.output,
     waitPayload.result,
+    waitPayload.content,
   ]
   for (const value of directCandidates) {
     if (typeof value === 'string' && value.trim()) return value.trim()
@@ -99,6 +108,7 @@ function extractReplyText(waitPayload: any): string | null {
       waitPayload.output.text,
       waitPayload.output.message,
       waitPayload.output.content,
+      waitPayload.output.reply,
     ]
     for (const value of nested) {
       if (typeof value === 'string' && value.trim()) return value.trim()
@@ -364,32 +374,60 @@ export async function POST(request: NextRequest) {
               ? `\n\n${ROUTING_CONTEXT_HEADER}\n${peerSessions}`
               : ''
 
-            const invokeParams: any = {
-              message: `Message from ${from}: ${content}${routingContext}`,
-              idempotencyKey: `mc-${messageId}-${Date.now()}`,
-              deliver: false,
-            }
-            if (sessionKey) invokeParams.sessionKey = sessionKey
-            else invokeParams.agentId = openclawAgentId
+            const fullMessage = `Message from ${from}: ${content}${routingContext}`
 
-            const invokeResult = await runOpenClaw(
-              [
-                'gateway',
-                'call',
-                'agent',
-                '--timeout',
-                '10000',
-                '--params',
-                JSON.stringify(invokeParams),
-                '--json',
-              ],
-              { timeoutMs: 12000 }
-            )
-            const acceptedPayload = parseGatewayJson(invokeResult.stdout)
-            forwardInfo.delivered = true
-            forwardInfo.session = sessionKey || openclawAgentId || undefined
-            if (typeof acceptedPayload?.runId === 'string' && acceptedPayload.runId) {
-              forwardInfo.runId = acceptedPayload.runId
+            if (sessionKey) {
+              // Existing session: use sessions.send to deliver to the live agent session.
+              // The agent's response will arrive as a gateway chat.message event (picked
+              // up by the server-side gateway-proxy or the browser WebSocket) and will be
+              // persisted / broadcast via the normal event pipeline.
+              // We do NOT use deliver:false here — that would suppress the gateway events
+              // that carry the agent's reply back to the dashboard.
+              await runOpenClaw(
+                [
+                  'gateway',
+                  'call',
+                  'sessions.send',
+                  '--json',
+                  '--params',
+                  JSON.stringify({ session: sessionKey, message: fullMessage }),
+                ],
+                { timeoutMs: 10000 }
+              )
+              forwardInfo.delivered = true
+              forwardInfo.session = sessionKey
+              // No runId — the agent's response travels via gateway chat.message events,
+              // so agent.wait is not needed and will not be started.
+            } else {
+              // No active session found: invoke agent by ID with deliver:false so the
+              // call returns immediately (no blocking on delivery ACK).  The response is
+              // retrieved via agent.wait in a background task.
+              const invokeParams = {
+                agentId: openclawAgentId,
+                message: fullMessage,
+                idempotencyKey: `mc-${messageId}-${Date.now()}`,
+                deliver: false,
+              }
+
+              const invokeResult = await runOpenClaw(
+                [
+                  'gateway',
+                  'call',
+                  'agent',
+                  '--timeout',
+                  '10000',
+                  '--params',
+                  JSON.stringify(invokeParams),
+                  '--json',
+                ],
+                { timeoutMs: 12000 }
+              )
+              const acceptedPayload = parseGatewayJson(invokeResult.stdout)
+              forwardInfo.delivered = true
+              forwardInfo.session = openclawAgentId || undefined
+              if (typeof acceptedPayload?.runId === 'string' && acceptedPayload.runId) {
+                forwardInfo.runId = acceptedPayload.runId
+              }
             }
           } catch (err) {
             // OpenClaw may return accepted JSON on stdout but still emit a late stderr warning.
