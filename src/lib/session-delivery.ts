@@ -1,15 +1,18 @@
-import { runClawdbot, runOpenClaw } from './command'
+import { runOpenClaw } from './command'
 
 /**
- * Try to deliver a session message via clawdbot and openclaw gateway in parallel.
+ * Try to deliver a session message via openclaw gateway.
  * Returns null on success or when session delivery is not supported on this
  * installation, or a non-empty error string if both methods genuinely fail.
  *
- * Both methods are fired simultaneously.  The first to succeed resolves null.
- * If the gateway immediately reports a definitive "not supported" error
- * ("unknown method" or "unknown command"), we resolve null immediately —
- * session delivery is simply not available on this installation, which is a
- * normal, expected state that should not generate a warning in callers.
+ * Two gateway methods are tried in parallel:
+ *  1. chat.send  – current OpenClaw 2026.x API  { sessionKey, message }
+ *  2. sessions.send – legacy fallback            { session, message }
+ *
+ * The first to succeed resolves null.  If either gives a definitive "not
+ * supported" error ("unknown method" or "unknown command"), we resolve null
+ * immediately — session delivery is simply not available on this installation,
+ * which is a normal, expected state that should not generate a warning.
  *
  * Typical timings:
  *  - Success via either method:        < 500 ms
@@ -21,7 +24,8 @@ export function sendSessionMessage(
   message: string,
   timeoutMs = 5000
 ): Promise<string | null> {
-  const payload = JSON.stringify({ session: sessionKey, message })
+  const chatSendPayload = JSON.stringify({ sessionKey, message })
+  const legacyPayload   = JSON.stringify({ session: sessionKey, message })
 
   return new Promise<string | null>((resolve) => {
     let done = false
@@ -32,47 +36,51 @@ export function sendSessionMessage(
       }
     }
 
-    let cbError: string | null = null
-    let cbDone = false
-    let gwError: string | null = null
-    let gwDone = false
+    let primaryError: string | null = null
+    let primaryDone = false
+    let legacyError: string | null = null
+    let legacyDone = false
 
     const checkBothFailed = () => {
-      if (cbDone && gwDone) {
-        // At least one must have an error for us to reach here (otherwise
-        // finish(null) would have been called on success).
+      if (primaryDone && legacyDone) {
         finish(
-          [cbError, gwError].filter(Boolean).join('; ') ||
+          [primaryError, legacyError].filter(Boolean).join('; ') ||
           'session delivery failed'
         )
       }
     }
 
-    // clawdbot attempt
-    runClawdbot(['sessions_send', sessionKey, message], { timeoutMs })
-      .then(() => finish(null))
-      .catch((e: any) => {
-        cbError = String(e?.message || 'clawdbot failed')
-        cbDone = true
-        checkBothFailed()
-      })
+    const isDefinitivelyUnsupported = (detail: string) =>
+      detail.includes('unknown method') || detail.includes('unknown command')
 
-    // Gateway RPC attempt
+    // Primary: openclaw gateway call chat.send (current API)
     runOpenClaw(
-      ['gateway', 'call', 'sessions.send', '--params', payload],
+      ['gateway', 'call', 'chat.send', '--params', chatSendPayload],
       { timeoutMs }
     )
       .then(() => finish(null))
       .catch((e: any) => {
         const detail = String(e?.stderr || e?.message || 'gateway failed')
-        gwError = detail
-        gwDone = true
-        // If gateway gives a definitive "not supported" error, session delivery
-        // is simply not available on this installation — this is a normal,
-        // expected state, not a failure.  Resolve null immediately so callers
-        // do not emit spurious warnings.  The clawdbot process continues in the
-        // background and will be killed by its own timeout.
-        if (detail.includes('unknown method') || detail.includes('unknown command')) {
+        primaryError = detail
+        primaryDone = true
+        if (isDefinitivelyUnsupported(detail)) {
+          finish(null)
+          return
+        }
+        checkBothFailed()
+      })
+
+    // Fallback: openclaw gateway call sessions.send (legacy API)
+    runOpenClaw(
+      ['gateway', 'call', 'sessions.send', '--params', legacyPayload],
+      { timeoutMs }
+    )
+      .then(() => finish(null))
+      .catch((e: any) => {
+        const detail = String(e?.stderr || e?.message || 'gateway failed')
+        legacyError = detail
+        legacyDone = true
+        if (isDefinitivelyUnsupported(detail)) {
           finish(null)
           return
         }

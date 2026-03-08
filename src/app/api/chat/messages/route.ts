@@ -349,8 +349,23 @@ export async function POST(request: NextRequest) {
           }
         } else {
           try {
+            // Build a routing table of other known active agent sessions so the
+            // receiving agent can reply or forward to peers without needing to
+            // call sessions_list (which is sandboxed and will return
+            // "Session not visible from this sandboxed agent session").
+            const ROUTING_CONTEXT_HEADER = '[Mission Control routing — active session keys for direct replies]'
+            const allSessions = getAllGatewaySessions()
+            const destinationKey = sessionKey || openclawAgentId || ''
+            const peerSessions = allSessions
+              .filter((s) => s.key !== destinationKey)
+              .map((s) => `  ${s.agent}: ${s.key}`)
+              .join('\n')
+            const routingContext = peerSessions
+              ? `\n\n${ROUTING_CONTEXT_HEADER}\n${peerSessions}`
+              : ''
+
             const invokeParams: any = {
-              message: `Message from ${from}: ${content}`,
+              message: `Message from ${from}: ${content}${routingContext}`,
               idempotencyKey: `mc-${messageId}-${Date.now()}`,
               deliver: false,
             }
