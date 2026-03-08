@@ -128,9 +128,9 @@ describe('POST /api/chat/messages — agent.wait for regular conversations', () 
   })
   afterEach(() => vi.clearAllMocks())
 
-  it('returns 201 immediately for non-coord conversations when sessionKey is available (sessions.send path)', async () => {
-    // When a live session is found, sessions.send is used — no background agent.wait.
-    mockRunOpenClaw.mockResolvedValueOnce({ stdout: '{"ok":true}', stderr: '', code: 0 })
+  it('returns 201 immediately for non-coord conversations when sessionKey is available (agent+deliver:true path)', async () => {
+    // When a live session is found, agent+deliver:true is used — no background agent.wait.
+    mockRunOpenClaw.mockResolvedValueOnce({ stdout: JSON.stringify({ status: 'accepted', runId: 'run-xyz' }), stderr: '', code: 0 })
     mockGetAllGatewaySessions.mockReturnValue([fakeSession])
 
     const start = Date.now()
@@ -144,10 +144,10 @@ describe('POST /api/chat/messages — agent.wait for regular conversations', () 
 
     expect(res.status).toBe(201)
     expect(elapsed).toBeLessThan(400)
-    // Only one call: sessions.send (no agent.wait for sessions.send path)
+    // Only one call: agent (no agent.wait for sessionKey+deliver:true path)
     expect(mockRunOpenClaw).toHaveBeenCalledTimes(1)
     const callArgs = (mockRunOpenClaw.mock.calls[0] as any[])[0] as string[]
-    expect(callArgs).toContain('sessions.send')
+    expect(callArgs).toContain('agent')
   })
 
   it('stores the agent reply in the DB via agent.wait when no live session (agentId path)', async () => {
@@ -174,8 +174,8 @@ describe('POST /api/chat/messages — agent.wait for regular conversations', () 
     expect(secondCallArgs).toContain('agent.wait')
   })
 
-  it('uses sessions.send with {session, message} params — no conversationId or idempotencyKey', async () => {
-    mockRunOpenClaw.mockResolvedValueOnce({ stdout: '{"ok":true}', stderr: '', code: 0 })
+  it('uses agent with {sessionKey, message, deliver:true} — no conversationId, runId NOT stored (no agent.wait)', async () => {
+    mockRunOpenClaw.mockResolvedValueOnce({ stdout: JSON.stringify({ status: 'accepted', runId: 'run-live' }), stderr: '', code: 0 })
     mockGetAllGatewaySessions.mockReturnValue([fakeSession])
 
     await POST(makeRequest({
@@ -186,19 +186,26 @@ describe('POST /api/chat/messages — agent.wait for regular conversations', () 
     }))
 
     const firstCallArgs = (mockRunOpenClaw.mock.calls[0] as any[])[0] as string[]
-    expect(firstCallArgs).toContain('sessions.send')
+    // Must use 'agent' method, not 'sessions.send'
+    expect(firstCallArgs).toContain('agent')
+    expect(firstCallArgs).not.toContain('sessions.send')
     const paramsIdx = firstCallArgs.indexOf('--params')
     const params = JSON.parse(firstCallArgs[paramsIdx + 1])
-    // sessions.send params: {session, message} — no conversationId, no idempotencyKey
-    expect(params.session).toBe('agent:coordinator:main')
+    // Live session path: {sessionKey, message, idempotencyKey, deliver: true}
+    expect(params.sessionKey).toBe('agent:coordinator:main')
+    expect(params.deliver).toBe(true)
     expect(params.message).toContain('hello')
     expect(params.conversationId).toBeUndefined()
-    expect(params.idempotencyKey).toBeUndefined()
+    expect(params.idempotencyKey).toBeDefined()
+
+    // No agent.wait should be started (only one openclaw call)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(mockRunOpenClaw).toHaveBeenCalledTimes(1)
   })
 
-  it('does NOT call the non-coordinator agent.wait block for coord: conversations', async () => {
-    // sessions.send path: coord conversations use sessions.send, no agent.wait
-    mockRunOpenClaw.mockResolvedValue({ stdout: '{"ok":true}', stderr: '', code: 0 })
+  it('does NOT call the non-coordinator agent.wait block for coord: conversations (sessionKey path)', async () => {
+    // sessionKey path: coord conversations use agent+deliver:true, no agent.wait
+    mockRunOpenClaw.mockResolvedValue({ stdout: JSON.stringify({ status: 'accepted', runId: 'run-coord' }), stderr: '', code: 0 })
     mockGetAllGatewaySessions.mockReturnValue([fakeSession])
 
     const res = await POST(makeRequest({
@@ -209,11 +216,11 @@ describe('POST /api/chat/messages — agent.wait for regular conversations', () 
     }))
 
     expect(res.status).toBe(201)
-    // For coord: conversations with sessions.send, only one gateway call
+    // For coord: conversations with agent+deliver:true, only one gateway call (no agent.wait)
     expect(mockRunOpenClaw).toHaveBeenCalledTimes(1)
   })
 
-  it('is non-fatal when sessions.send fails — returns 201 and stores the user message', async () => {
+  it('is non-fatal when agent invocation fails for live session — returns 201 and stores the user message', async () => {
     mockRunOpenClaw.mockRejectedValueOnce(new Error('gateway unavailable'))
     mockGetAllGatewaySessions.mockReturnValue([fakeSession])
 
@@ -298,7 +305,7 @@ describe('POST /api/chat/messages — agent routing', () => {
     expect(params.idempotencyKey).toBeDefined()
   })
 
-  it('uses sessions.send with live session key (not DB session_key) when a live session exists', async () => {
+  it('uses agent with {sessionKey, deliver:true} when a live session exists — NOT the stale DB session_key', async () => {
     // Agent has a stale DB session_key that does NOT match any live session
     mockStmt.get.mockReturnValueOnce({
       id: 2,
@@ -310,7 +317,7 @@ describe('POST /api/chat/messages — agent routing', () => {
     // A live session exists in the gateway session store with the proper format
     mockGetAllGatewaySessions.mockReturnValue([fakeSession]) // key: 'agent:coordinator:main'
 
-    mockRunOpenClaw.mockResolvedValueOnce({ stdout: '{"ok":true}', stderr: '', code: 0 })
+    mockRunOpenClaw.mockResolvedValueOnce({ stdout: JSON.stringify({ status: 'accepted', runId: 'run-2' }), stderr: '', code: 0 })
 
     await POST(makeRequest({
       content: 'hello',
@@ -320,14 +327,17 @@ describe('POST /api/chat/messages — agent routing', () => {
     }))
 
     const firstCallArgs = (mockRunOpenClaw.mock.calls[0] as any[])[0] as string[]
-    expect(firstCallArgs).toContain('sessions.send')
+    // Must use 'agent' method — never 'sessions.send'
+    expect(firstCallArgs).toContain('agent')
+    expect(firstCallArgs).not.toContain('sessions.send')
     const paramsIdx = firstCallArgs.indexOf('--params')
     const params = JSON.parse(firstCallArgs[paramsIdx + 1])
 
-    // sessions.send uses {session: sessionKey} — NOT the stale DB label
-    expect(params.session).toBe('agent:coordinator:main')
-    expect(params.session).not.toBe('stale-custom-label')
-    expect(params.sessionKey).toBeUndefined()
+    // The properly-formatted live session key is used, NOT the stale DB label
+    expect(params.sessionKey).toBe('agent:coordinator:main')
+    expect(params.sessionKey).not.toBe('stale-custom-label')
+    expect(params.deliver).toBe(true)
+    expect(params.agentId).toBeUndefined()
   })
 })
 

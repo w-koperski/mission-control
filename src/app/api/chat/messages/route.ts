@@ -377,27 +377,37 @@ export async function POST(request: NextRequest) {
             const fullMessage = `Message from ${from}: ${content}${routingContext}`
 
             if (sessionKey) {
-              // Existing session: use sessions.send to deliver to the live agent session.
-              // The agent's response will arrive as a gateway chat.message event (picked
-              // up by the server-side gateway-proxy or the browser WebSocket) and will be
-              // persisted / broadcast via the normal event pipeline.
-              // We do NOT use deliver:false here — that would suppress the gateway events
-              // that carry the agent's reply back to the dashboard.
-              await runOpenClaw(
+              // Existing live session: invoke via `agent` with deliver:true so the
+              // gateway emits a chat.message event when the agent responds.  The event
+              // is picked up by the server-side gateway-proxy (or browser WebSocket)
+              // and persisted / broadcast through the normal SSE pipeline.
+              // We deliberately do NOT store forwardInfo.runId here — that would
+              // trigger the background agent.wait task which would create a duplicate
+              // reply (the gateway already delivers the response via chat.message).
+              const sessionInvokeParams = {
+                sessionKey,
+                message: fullMessage,
+                idempotencyKey: `mc-${messageId}-${Date.now()}`,
+                deliver: true,
+              }
+              const sessionInvokeResult = await runOpenClaw(
                 [
                   'gateway',
                   'call',
-                  'sessions.send',
-                  '--json',
+                  'agent',
+                  '--timeout',
+                  '10000',
                   '--params',
-                  JSON.stringify({ session: sessionKey, message: fullMessage }),
+                  JSON.stringify(sessionInvokeParams),
+                  '--json',
                 ],
-                { timeoutMs: 10000 }
+                { timeoutMs: 12000 }
               )
+              // Capture accepted payload for logging, but intentionally skip runId
+              // so the agent.wait background task does NOT start.
+              parseGatewayJson(sessionInvokeResult.stdout)
               forwardInfo.delivered = true
               forwardInfo.session = sessionKey
-              // No runId — the agent's response travels via gateway chat.message events,
-              // so agent.wait is not needed and will not be started.
             } else {
               // No active session found: invoke agent by ID with deliver:false so the
               // call returns immediately (no blocking on delivery ACK).  The response is
@@ -587,9 +597,10 @@ export async function POST(request: NextRequest) {
 
           // Regular agent conversations (agent_<name> format from the chat panel):
           // Run agent.wait in a background task so the 201 response is returned
-          // immediately.  With deliver: false the gateway will not emit a
-          // chat.message event on its own, so this is the only path that surfaces
-          // the response in the UI.
+          // immediately.  This path only fires when forwardInfo.runId is set, which
+          // only happens for the agentId-only (no live session) invocation path that
+          // uses deliver:false.  The sessionKey path uses deliver:true and relies on
+          // gateway chat.message events instead — forwardInfo.runId is NOT set there.
           if (
             typeof conversation_id === 'string' &&
             !conversation_id.startsWith('coord:') &&
