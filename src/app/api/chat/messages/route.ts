@@ -263,9 +263,23 @@ export async function POST(request: NextRequest) {
       if (body.forward) {
         forwardInfo = { attempted: true, delivered: false }
 
-        const agent = db
+        let agent = db
           .prepare('SELECT * FROM agents WHERE lower(name) = lower(?) AND workspace_id = ?')
           .get(to, workspaceId) as any
+
+        // Coordinator alias handling: if UI/threads address "coordinator",
+        // resolve to the configured coordinator agent (Mission Control by default).
+        const resolvedCoordinatorName =
+          String(process.env.MC_COORDINATOR_AGENT || 'Mission Control').trim() || 'Mission Control'
+        const isCoordinatorAlias =
+          typeof to === 'string' &&
+          ['coordinator', COORDINATOR_AGENT.toLowerCase()].includes(to.toLowerCase())
+
+        if (!agent && isCoordinatorAlias) {
+          agent = db
+            .prepare('SELECT * FROM agents WHERE lower(name) = lower(?) AND workspace_id = ?')
+            .get(resolvedCoordinatorName, workspaceId) as any
+        }
 
         let sessionKey: string | null = null
 
@@ -276,9 +290,23 @@ export async function POST(request: NextRequest) {
         // not be used here.
         if (!sessionKey) {
           const sessions = getAllGatewaySessions()
-          const match = sessions.find(
-            (s) => s.agent.toLowerCase() === String(to).toLowerCase()
-          )
+          const targetName = isCoordinatorAlias ? resolvedCoordinatorName : String(to)
+          const normalizedTarget = targetName.toLowerCase().replace(/\s+/g, '-')
+          // Also try the original recipient name (e.g. "coordinator") as a fallback
+          const originalTarget = String(to).toLowerCase()
+
+          const match = sessions.find((s) => {
+            const agentName = String(s.agent || '').toLowerCase()
+            const sessionId = String((s as any).sessionId || '').toLowerCase()
+            const key = String(s.key || '').toLowerCase()
+            return (
+              agentName === targetName.toLowerCase() ||
+              agentName === normalizedTarget ||
+              agentName === originalTarget ||
+              sessionId.includes(normalizedTarget) ||
+              key.includes(normalizedTarget)
+            )
+          })
           sessionKey = match?.key || null
         }
 
@@ -295,7 +323,8 @@ export async function POST(request: NextRequest) {
           }
         }
         if (!openclawAgentId && typeof to === 'string') {
-          openclawAgentId = to.toLowerCase().replace(/\s+/g, '-')
+          if (isCoordinatorAlias) openclawAgentId = 'mission-control'
+          else openclawAgentId = to.toLowerCase().replace(/\s+/g, '-')
         }
 
         if (!sessionKey && !openclawAgentId) {
@@ -332,7 +361,7 @@ export async function POST(request: NextRequest) {
               [
                 'gateway',
                 'call',
-                'agent',
+                sessionKey ? 'chat.send' : 'agent',
                 '--timeout',
                 '10000',
                 '--params',
@@ -352,7 +381,12 @@ export async function POST(request: NextRequest) {
             // Treat accepted runs as successful delivery.
             const maybeStdout = String((err as any)?.stdout || '')
             const acceptedPayload = parseGatewayJson(maybeStdout)
-            if (maybeStdout.includes('"status": "accepted"') || maybeStdout.includes('"status":"accepted"')) {
+            if (
+              maybeStdout.includes('"status": "accepted"') ||
+              maybeStdout.includes('"status":"accepted"') ||
+              maybeStdout.includes('"status": "started"') ||
+              maybeStdout.includes('"status":"started"')
+            ) {
               forwardInfo.delivered = true
               forwardInfo.session = sessionKey || openclawAgentId || undefined
               if (typeof acceptedPayload?.runId === 'string' && acceptedPayload.runId) {
