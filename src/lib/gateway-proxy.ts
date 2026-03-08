@@ -14,6 +14,7 @@ import WebSocket from 'ws'
 import { EventEmitter } from 'node:events'
 import { config } from './config'
 import { logger } from './logger'
+import { persistGatewayMessage } from './gateway-message-persist'
 
 // ---------------------------------------------------------------------------
 // Allowlist
@@ -218,6 +219,19 @@ class GatewayProxyManager extends EventEmitter {
       frame.type === 'pong'
     ) {
       this.emit('gateway_event', frame)
+
+      // Persist agent-to-agent chat.message events to the DB so that:
+      //  - the comms panel (/api/agents/comms) shows real agent conversations
+      //  - replies survive page reloads
+      //  - SSE clients receive the message via eventBus (not just this WS stream)
+      if (
+        frame.type === 'event' &&
+        typeof frame.event === 'string' &&
+        frame.event === 'chat.message' &&
+        frame.payload
+      ) {
+        persistGatewayMessage(frame.payload as any)
+      }
     }
   }
 

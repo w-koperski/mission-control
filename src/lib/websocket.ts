@@ -12,6 +12,7 @@ import {
 } from '@/lib/device-identity'
 import { APP_VERSION } from '@/lib/version'
 import { createClientLogger } from '@/lib/client-logger'
+import { isHumanAgent } from '@/lib/agent-names'
 
 const log = createClientLogger('WebSocket')
 
@@ -508,6 +509,19 @@ export function useWebSocket() {
             read_at: msg.read_at,
             created_at: msg.created_at || Math.floor(Date.now() / 1000),
           })
+
+          // Persist agent-originated messages to the server DB so they survive
+          // page reloads and appear in the comms panel.  Fire-and-forget — the
+          // endpoint deduplicates by gateway message id, so retries are safe.
+          // (In proxy mode this is handled server-side by gateway-proxy.ts instead.)
+          if (msg.from_agent && !isHumanAgent(msg.from_agent)) {
+            fetch('/api/chat/messages/ingest', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(msg),
+              credentials: 'same-origin',
+            }).catch(() => { /* best-effort; failures are logged server-side */ })
+          }
         }
       } else if (frame.event === 'notification') {
         // Real-time notification from gateway

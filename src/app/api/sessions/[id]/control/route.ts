@@ -50,6 +50,9 @@ export async function POST(
       const callParams = {
         sessionKey: id,
         message,
+        // deliver: false — sends to the agent's session without waiting for a
+        // gateway push-delivery acknowledgement.  Control signals are fire-and-
+        // forget; we don't want the call to block on delivery confirmation.
         deliver: false,
         idempotencyKey: randomUUID(),
       }
