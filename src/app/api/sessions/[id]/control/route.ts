@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { runClawdbot } from '@/lib/command'
+import { runOpenClaw } from '@/lib/command'
 import { db_helpers } from '@/lib/db'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { randomUUID } from 'node:crypto'
 
 // Only allow alphanumeric, hyphens, and underscores in session IDs
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/
@@ -38,16 +39,22 @@ export async function POST(
 
     let result
     if (action === 'terminate') {
-      result = await runClawdbot(
-        ['sessions_kill', id],
+      result = await runOpenClaw(
+        ['gateway', 'call', 'sessions.terminate', '--json', '--params', JSON.stringify({ sessionKey: id })],
         { timeoutMs: 10000 }
       )
     } else {
       const message = action === 'monitor'
         ? JSON.stringify({ type: 'control', action: 'monitor' })
         : JSON.stringify({ type: 'control', action: 'pause' })
-      result = await runClawdbot(
-        ['sessions_send', id, message],
+      const callParams = {
+        sessionKey: id,
+        message,
+        deliver: false,
+        idempotencyKey: randomUUID(),
+      }
+      result = await runOpenClaw(
+        ['gateway', 'call', 'chat.send', '--json', '--params', JSON.stringify(callParams)],
         { timeoutMs: 10000 }
       )
     }

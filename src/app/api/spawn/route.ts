@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { runClawdbot } from '@/lib/command'
+import { runOpenClaw } from '@/lib/command'
 import { requireRole } from '@/lib/auth'
 import { config } from '@/lib/config'
 import { readdir, readFile, stat } from 'fs/promises'
@@ -7,16 +7,29 @@ import { join } from 'path'
 import { heavyLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { validateBody, spawnAgentSchema } from '@/lib/validation'
+import { getModelByAlias } from '@/lib/models'
 
 function getPreferredToolsProfile(): string {
   return String(process.env.OPENCLAW_TOOLS_PROFILE || 'coding').trim() || 'coding'
 }
 
+/**
+ * Resolve a model alias (e.g. 'sonnet') or passthrough a full model name
+ * (e.g. 'anthropic/claude-sonnet-4-20250514') to the canonical openclaw model name.
+ */
+function resolveModelName(model: string): string {
+  const found = getModelByAlias(model)
+  return found ? found.name : model
+}
+
 async function runSpawnWithCompatibility(spawnPayload: Record<string, unknown>) {
-  // The sessions_spawn command starts an agent session which can take 30-120 seconds
+  // The sessions.spawn call starts an agent session which can take 30-120 seconds
   // to spin up (model download, initialisation, etc.).  Use a generous timeout so we
   // don't kill the spawn process before the session is established.
-  return runClawdbot(['sessions_spawn', JSON.stringify(spawnPayload)], { timeoutMs: 120_000 })
+  return runOpenClaw(
+    ['gateway', 'call', 'sessions.spawn', '--json', '--params', JSON.stringify(spawnPayload)],
+    { timeoutMs: 120_000 }
+  )
 }
 
 export async function POST(request: NextRequest) {
@@ -36,11 +49,14 @@ export async function POST(request: NextRequest) {
     // Generate spawn ID
     const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 
+    // Resolve model alias to full openclaw model name (e.g. 'sonnet' → 'anthropic/claude-sonnet-4-20250514')
+    const resolvedModel = resolveModelName(model)
+
     // Construct the spawn command
-    // Using OpenClaw's sessions_spawn function via clawdbot CLI
+    // Using OpenClaw's gateway sessions.spawn method
     const spawnPayload = {
       task,
-      model,
+      model: resolvedModel,
       label,
       runTimeoutSeconds: timeout,
       tools: {
@@ -92,7 +108,7 @@ export async function POST(request: NextRequest) {
         spawnId,
         sessionInfo,
         task,
-        model,
+        model: resolvedModel,
         label,
         timeoutSeconds: timeout,
         createdAt: Date.now(),
