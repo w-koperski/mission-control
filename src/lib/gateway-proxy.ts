@@ -14,6 +14,7 @@ import WebSocket from 'ws'
 import { EventEmitter } from 'node:events'
 import { config } from './config'
 import { logger } from './logger'
+import { persistGatewayMessage } from './gateway-message-persist'
 
 // ---------------------------------------------------------------------------
 // Allowlist
@@ -59,19 +60,21 @@ const CALL_TIMEOUT_MS = 10_000
  * - Uses `wss://` when `OPENCLAW_GATEWAY_PROTOCOL` is set to `wss` or `https`,
  *   or when the gateway host is not a local/loopback address.
  * - Defaults to `ws://` for loopback/localhost hosts.
- *
- * IMPORTANT: Do NOT set OPENCLAW_GATEWAY_HOST to `0.0.0.0`.  That address
- * is a bind wildcard — it is valid for `listen()` but not for outbound
- * connections.  Use `127.0.0.1` (or the specific interface IP) instead.
+ * - `0.0.0.0` and `::` are bind-wildcard addresses; they cannot be used for
+ *   outbound connections.  We treat them as loopback (`ws://`) rather than
+ *   crashing with an SSL error, and log a warning so operators notice the
+ *   misconfiguration.
  */
-function buildGatewayWsUrl(host: string, port: number): string {
+export function buildGatewayWsUrl(host: string, port: number): string {
   const explicitProtocol = process.env.OPENCLAW_GATEWAY_PROTOCOL || ''
   if (explicitProtocol === 'wss' || explicitProtocol === 'https') {
     return `wss://${host}:${port}`
   }
   const isLocal =
     host === '127.0.0.1' ||
+    host === '0.0.0.0' ||    // bind-wildcard: treat as loopback for outbound
     host === '::1' ||
+    host === '::' ||          // IPv6 bind-wildcard: treat as loopback for outbound
     host.toLowerCase() === 'localhost' ||
     host.toLowerCase().endsWith('.local')
   const protocol = isLocal ? 'ws' : 'wss'
@@ -105,7 +108,21 @@ class GatewayProxyManager extends EventEmitter {
     }
 
     this._stopping = false
-    const url = buildGatewayWsUrl(config.gatewayHost, config.gatewayPort)
+    const host = config.gatewayHost
+    if (host === '0.0.0.0' || host === '::') {
+      logger.warn(
+        { host },
+        '[gateway-proxy] OPENCLAW_GATEWAY_HOST is set to a bind-wildcard address. ' +
+        'This works but is not recommended for outbound connections; prefer 127.0.0.1.',
+      )
+      // In production, escalate the problem to an error-level log so operators
+      // don't miss the configuration issue. We still attempt the connection to
+      // avoid surprising behavior, but this log will be prominent in production.
+      if (process.env.NODE_ENV === 'production') {
+        logger.error({ host }, '[gateway-proxy] Bind-wildcard OPENCLAW_GATEWAY_HOST detected in production. Set OPENCLAW_GATEWAY_HOST=127.0.0.1 to avoid connection issues.')
+      }
+    }
+    const url = buildGatewayWsUrl(host, config.gatewayPort)
     logger.info({ url }, '[gateway-proxy] Connecting to gateway')
 
     const ws = new WebSocket(url)
@@ -142,13 +159,22 @@ class GatewayProxyManager extends EventEmitter {
       }
 
       if (!this._stopping) {
+        // For normal closures (code 1000) the gateway ended the session cleanly
+        // and is expected to be available again immediately.  Reset the backoff
+        // counter so we reconnect with the minimum delay instead of waiting an
+        // exponentially increasing time.
+        if (code === 1000) {
+          this.reconnectAttempts = 0
+        }
         this._scheduleReconnect()
       }
     })
 
     ws.on('error', (err) => {
       logger.warn({ err }, '[gateway-proxy] Gateway WebSocket error')
-      this.emit('error', err)
+      // Do NOT re-emit as an EventEmitter 'error' event: Node.js throws
+      // unhandled 'error' events as uncaughtException, crashing the process.
+      // The ws 'close' handler fires immediately after and handles reconnection.
     })
   }
 
@@ -199,6 +225,19 @@ class GatewayProxyManager extends EventEmitter {
       frame.type === 'pong'
     ) {
       this.emit('gateway_event', frame)
+
+      // Persist agent-to-agent chat.message events to the DB so that:
+      //  - the comms panel (/api/agents/comms) shows real agent conversations
+      //  - replies survive page reloads
+      //  - SSE clients receive the message via eventBus (not just this WS stream)
+      if (
+        frame.type === 'event' &&
+        typeof frame.event === 'string' &&
+        frame.event === 'chat.message' &&
+        frame.payload
+      ) {
+        persistGatewayMessage(frame.payload as any)
+      }
     }
   }
 

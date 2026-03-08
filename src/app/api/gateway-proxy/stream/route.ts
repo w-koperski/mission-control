@@ -34,7 +34,12 @@ export async function GET(request: NextRequest) {
 
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) {
-    return new Response(auth.error, { status: auth.status })
+    // Return structured JSON on auth failure so client-side hooks can
+    // reliably detect proxy auth errors and fall back to direct gateway
+    // connections when appropriate. Clients should treat any non-200
+    // response as a reason to attempt a fallback.
+    const body = JSON.stringify({ error: auth.error, code: auth.status, reason: 'proxy_auth_failed' })
+    return new Response(body, { status: auth.status, headers: { 'Content-Type': 'application/json' } })
   }
 
   const rateCheck = readLimiter(request)

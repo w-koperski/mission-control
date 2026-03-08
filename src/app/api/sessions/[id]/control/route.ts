@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { runClawdbot } from '@/lib/command'
+import { runOpenClaw } from '@/lib/command'
 import { db_helpers } from '@/lib/db'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
@@ -38,16 +38,18 @@ export async function POST(
 
     let result
     if (action === 'terminate') {
-      result = await runClawdbot(
-        ['sessions_kill', id],
+      result = await runOpenClaw(
+        ['gateway', 'call', 'sessions.terminate', '--json', '--params', JSON.stringify({ sessionKey: id })],
         { timeoutMs: 10000 }
       )
     } else {
       const message = action === 'monitor'
         ? JSON.stringify({ type: 'control', action: 'monitor' })
         : JSON.stringify({ type: 'control', action: 'pause' })
-      result = await runClawdbot(
-        ['sessions_send', id, message],
+      // Use sessions.send to deliver control signals directly to an existing session.
+      // Documented API: openclaw gateway call sessions.send --params '{"session":"...","message":"..."}'
+      result = await runOpenClaw(
+        ['gateway', 'call', 'sessions.send', '--json', '--params', JSON.stringify({ session: id, message })],
         { timeoutMs: 10000 }
       )
     }

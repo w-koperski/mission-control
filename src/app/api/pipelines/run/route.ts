@@ -4,6 +4,10 @@ import { requireRole } from '@/lib/auth'
 import { eventBus } from '@/lib/event-bus'
 import { logger } from '@/lib/logger'
 
+// Extra seconds added on top of the template's runTimeoutSeconds when computing
+// the Node.js process kill timer for the gateway CLI call.
+const SPAWN_CLI_BUFFER_SECONDS = 30
+
 interface PipelineStep {
   template_id: number
   on_failure: 'stop' | 'continue'
@@ -116,7 +120,7 @@ export async function POST(request: NextRequest) {
   }
 }
 
-/** Spawn a single pipeline step using `openclaw agent` */
+/** Spawn a single pipeline step via `openclaw gateway call sessions.spawn` */
 async function spawnStep(
   db: ReturnType<typeof getDatabase>,
   pipelineName: string,
@@ -128,13 +132,21 @@ async function spawnStep(
 ): Promise<{ success: boolean; stdout?: string; error?: string }> {
   try {
     const { runOpenClaw } = await import('@/lib/command')
+    // Use sessions.spawn so the step runs as a new agent session.  The --timeout
+    // flag on the gateway call covers the network round-trip; runTimeoutSeconds
+    // tells openclaw how long the agent session itself may run.
+    const spawnPayload = {
+      task: `[Pipeline: ${pipelineName} | Step ${stepIdx + 1}] ${template.task_prompt}`,
+      model: template.model || undefined,
+      runTimeoutSeconds: template.timeout_seconds,
+    }
     const args = [
-      'agent',
-      '--message', `[Pipeline: ${pipelineName} | Step ${stepIdx + 1}] ${template.task_prompt}`,
-      '--timeout', String(template.timeout_seconds),
+      'gateway', 'call', 'sessions.spawn',
       '--json',
+      '--params', JSON.stringify(spawnPayload),
     ]
-    const { stdout } = await runOpenClaw(args, { timeoutMs: 15000 })
+    // Allow up to the template timeout + a 30 s buffer for the CLI round-trip.
+    const { stdout } = await runOpenClaw(args, { timeoutMs: (template.timeout_seconds + SPAWN_CLI_BUFFER_SECONDS) * 1000 })
 
     const spawnId = `pipeline-${runId}-step-${stepIdx}-${Date.now()}`
     steps[stepIdx].spawn_id = spawnId

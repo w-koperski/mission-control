@@ -27,20 +27,17 @@ export async function POST(request: NextRequest) {
     if (!agent) {
       return NextResponse.json({ error: 'Recipient agent not found' }, { status: 404 })
     }
-    if (!agent.session_key) {
-      return NextResponse.json(
-        { error: 'Recipient agent has no session key configured' },
-        { status: 400 }
-      )
-    }
-
     // Try local clawdbot first, then gateway RPC — in parallel (best-effort).
-    const payload = { session: agent.session_key, message: `Message from ${from}: ${message}` }
+    // session_key is optional; skip session delivery when it's absent and fall
+    // through to notification-only delivery.
+    const fullMessage = `Message from ${from}: ${message}`
     let sessionDeliveryFailed = false
-    const deliveryErr = await sendSessionMessage(agent.session_key, payload.message)
-    if (deliveryErr) {
-      sessionDeliveryFailed = true
-      logger.warn({ err: deliveryErr, agent: to }, 'Session delivery failed; message stored as notification only')
+    if (agent.session_key) {
+      const deliveryErr = await sendSessionMessage(agent.session_key, fullMessage)
+      if (deliveryErr) {
+        sessionDeliveryFailed = true
+        logger.warn({ err: deliveryErr, agent: to }, 'Session delivery failed; message stored as notification only')
+      }
     }
 
     db_helpers.createNotification(

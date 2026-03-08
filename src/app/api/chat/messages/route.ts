@@ -18,6 +18,20 @@ const COORDINATOR_AGENT =
   String(process.env.MC_COORDINATOR_AGENT || process.env.NEXT_PUBLIC_COORDINATOR_AGENT || 'coordinator').trim() ||
   'coordinator'
 
+// Timeouts for agent.wait calls.
+//
+// Coordinator conversations (coord:*): a short poll so we surface status
+// feedback quickly; the coordinator already creates "accepted" / "processing"
+// messages before the wait.
+//
+// Non-coordinator agents: run in a background task (fire-and-forget) so the
+// POST handler returns 201 immediately.  The wait is much longer because LLM
+// responses routinely take 15–60 s.
+const COORD_AGENT_WAIT_MS     = 6_000
+const COORD_AGENT_WAIT_CMD_MS = 9_000
+const AGENT_WAIT_MS     = 55_000
+const AGENT_WAIT_CMD_MS = 60_000
+
 function parseGatewayJson(raw: string): any | null {
   const trimmed = String(raw || '').trim()
   if (!trimmed) return null
@@ -66,15 +80,24 @@ function createChatReply(
   })
 }
 
+/**
+ * Extract a human-readable reply string from an openclaw agent.wait payload.
+ *
+ * Fields are checked in priority order — most specific/likely first:
+ *   reply > text > message > response > output (string) > result > content
+ * For a nested `output` object the same priority applies: text > message > content > reply.
+ */
 function extractReplyText(waitPayload: any): string | null {
   if (!waitPayload || typeof waitPayload !== 'object') return null
 
   const directCandidates = [
+    waitPayload.reply,
     waitPayload.text,
     waitPayload.message,
     waitPayload.response,
     waitPayload.output,
     waitPayload.result,
+    waitPayload.content,
   ]
   for (const value of directCandidates) {
     if (typeof value === 'string' && value.trim()) return value.trim()
@@ -85,6 +108,7 @@ function extractReplyText(waitPayload: any): string | null {
       waitPayload.output.text,
       waitPayload.output.message,
       waitPayload.output.content,
+      waitPayload.output.reply,
     ]
     for (const value of nested) {
       if (typeof value === 'string' && value.trim()) return value.trim()
@@ -249,19 +273,51 @@ export async function POST(request: NextRequest) {
       if (body.forward) {
         forwardInfo = { attempted: true, delivered: false }
 
-        const agent = db
+        let agent = db
           .prepare('SELECT * FROM agents WHERE lower(name) = lower(?) AND workspace_id = ?')
           .get(to, workspaceId) as any
 
-        let sessionKey: string | null = agent?.session_key || null
+        // Coordinator alias handling: if UI/threads address "coordinator",
+        // resolve to the configured coordinator agent (Mission Control by default).
+        const resolvedCoordinatorName =
+          String(process.env.MC_COORDINATOR_AGENT || 'Mission Control').trim() || 'Mission Control'
+        const isCoordinatorAlias =
+          typeof to === 'string' &&
+          ['coordinator', COORDINATOR_AGENT.toLowerCase()].includes(to.toLowerCase())
 
-        // Fallback: derive session from on-disk gateway session stores
+        if (!agent && isCoordinatorAlias) {
+          agent = db
+            .prepare('SELECT * FROM agents WHERE lower(name) = lower(?) AND workspace_id = ?')
+            .get(resolvedCoordinatorName, workspaceId) as any
+        }
+
+        let sessionKey: string | null = null
+
+        // Derive session from on-disk gateway session stores.
+        // Keys in those stores have the format "agent:<name>:main" which OpenClaw
+        // uses to identify the target agent.  The session_key column in the DB is a
+        // user-defined label that OpenClaw does not recognise for routing and must
+        // not be used here.
         if (!sessionKey) {
           const sessions = getAllGatewaySessions()
-          const match = sessions.find(
-            (s) => s.agent.toLowerCase() === String(to).toLowerCase()
-          )
-          sessionKey = match?.key || match?.sessionId || null
+          const targetName = isCoordinatorAlias ? resolvedCoordinatorName : String(to)
+          const normalizedTarget = targetName.toLowerCase().replace(/\s+/g, '-')
+          // Also try the original recipient name (e.g. "coordinator") as a fallback
+          const originalTarget = String(to).toLowerCase()
+
+          const match = sessions.find((s) => {
+            const agentName = String(s.agent || '').toLowerCase()
+            const sessionId = String((s as any).sessionId || '').toLowerCase()
+            const key = String(s.key || '').toLowerCase()
+            return (
+              agentName === targetName.toLowerCase() ||
+              agentName === normalizedTarget ||
+              agentName === originalTarget ||
+              sessionId.includes(normalizedTarget) ||
+              key.includes(normalizedTarget)
+            )
+          })
+          sessionKey = match?.key || null
         }
 
         // Prefer configured openclawId when present, fallback to normalized name
@@ -277,7 +333,8 @@ export async function POST(request: NextRequest) {
           }
         }
         if (!openclawAgentId && typeof to === 'string') {
-          openclawAgentId = to.toLowerCase().replace(/\s+/g, '-')
+          if (isCoordinatorAlias) openclawAgentId = 'mission-control'
+          else openclawAgentId = to.toLowerCase().replace(/\s+/g, '-')
         }
 
         if (!sessionKey && !openclawAgentId) {
@@ -302,39 +359,97 @@ export async function POST(request: NextRequest) {
           }
         } else {
           try {
-            const invokeParams: any = {
-              message: `Message from ${from}: ${content}`,
-              idempotencyKey: `mc-${messageId}-${Date.now()}`,
-              deliver: false,
-            }
-            if (sessionKey) invokeParams.sessionKey = sessionKey
-            else invokeParams.agentId = openclawAgentId
+            // Build a routing table of other known active agent sessions so the
+            // receiving agent can reply or forward to peers without needing to
+            // call sessions_list (which is sandboxed and will return
+            // "Session not visible from this sandboxed agent session").
+            const ROUTING_CONTEXT_HEADER = '[Mission Control routing — active session keys for direct replies]'
+            const allSessions = getAllGatewaySessions()
+            const destinationKey = sessionKey || openclawAgentId || ''
+            const peerSessions = allSessions
+              .filter((s) => s.key !== destinationKey)
+              .map((s) => `  ${s.agent}: ${s.key}`)
+              .join('\n')
+            const routingContext = peerSessions
+              ? `\n\n${ROUTING_CONTEXT_HEADER}\n${peerSessions}`
+              : ''
 
-            const invokeResult = await runOpenClaw(
-              [
-                'gateway',
-                'call',
-                'agent',
-                '--timeout',
-                '10000',
-                '--params',
-                JSON.stringify(invokeParams),
-                '--json',
-              ],
-              { timeoutMs: 12000 }
-            )
-            const acceptedPayload = parseGatewayJson(invokeResult.stdout)
-            forwardInfo.delivered = true
-            forwardInfo.session = sessionKey || openclawAgentId || undefined
-            if (typeof acceptedPayload?.runId === 'string' && acceptedPayload.runId) {
-              forwardInfo.runId = acceptedPayload.runId
+            const fullMessage = `Message from ${from}: ${content}${routingContext}`
+
+            if (sessionKey) {
+              // Existing live session: invoke via `agent` with deliver:true so the
+              // gateway emits a chat.message event when the agent responds.  The event
+              // is picked up by the server-side gateway-proxy (or browser WebSocket)
+              // and persisted / broadcast through the normal SSE pipeline.
+              // We deliberately do NOT store forwardInfo.runId here — that would
+              // trigger the background agent.wait task which would create a duplicate
+              // reply (the gateway already delivers the response via chat.message).
+              const sessionInvokeParams = {
+                sessionKey,
+                message: fullMessage,
+                idempotencyKey: `mc-${messageId}-${Date.now()}`,
+                deliver: true,
+              }
+              const sessionInvokeResult = await runOpenClaw(
+                [
+                  'gateway',
+                  'call',
+                  'agent',
+                  '--timeout',
+                  '10000',
+                  '--params',
+                  JSON.stringify(sessionInvokeParams),
+                  '--json',
+                ],
+                { timeoutMs: 12000 }
+              )
+              // Capture accepted payload for logging, but intentionally skip runId
+              // so the agent.wait background task does NOT start.
+              parseGatewayJson(sessionInvokeResult.stdout)
+              forwardInfo.delivered = true
+              forwardInfo.session = sessionKey
+            } else {
+              // No active session found: invoke agent by ID with deliver:false so the
+              // call returns immediately (no blocking on delivery ACK).  The response is
+              // retrieved via agent.wait in a background task.
+              const invokeParams = {
+                agentId: openclawAgentId,
+                message: fullMessage,
+                idempotencyKey: `mc-${messageId}-${Date.now()}`,
+                deliver: false,
+              }
+
+              const invokeResult = await runOpenClaw(
+                [
+                  'gateway',
+                  'call',
+                  'agent',
+                  '--timeout',
+                  '10000',
+                  '--params',
+                  JSON.stringify(invokeParams),
+                  '--json',
+                ],
+                { timeoutMs: 12000 }
+              )
+              const acceptedPayload = parseGatewayJson(invokeResult.stdout)
+              forwardInfo.delivered = true
+              forwardInfo.session = openclawAgentId || undefined
+              if (typeof acceptedPayload?.runId === 'string' && acceptedPayload.runId) {
+                forwardInfo.runId = acceptedPayload.runId
+              }
             }
           } catch (err) {
             // OpenClaw may return accepted JSON on stdout but still emit a late stderr warning.
             // Treat accepted runs as successful delivery.
             const maybeStdout = String((err as any)?.stdout || '')
             const acceptedPayload = parseGatewayJson(maybeStdout)
-            if (maybeStdout.includes('"status": "accepted"') || maybeStdout.includes('"status":"accepted"')) {
+            if (
+              maybeStdout.includes('"status": "accepted"') ||
+              maybeStdout.includes('"status":"accepted"') ||
+              maybeStdout.includes('"status": "started"') ||
+              maybeStdout.includes('"status":"started"')
+            ) {
               forwardInfo.delivered = true
               forwardInfo.session = sessionKey || openclawAgentId || undefined
               if (typeof acceptedPayload?.runId === 'string' && acceptedPayload.runId) {
@@ -394,12 +509,12 @@ export async function POST(request: NextRequest) {
                     'call',
                     'agent.wait',
                     '--timeout',
-                    '8000',
+                    String(COORD_AGENT_WAIT_CMD_MS - 1000),
                     '--params',
-                    JSON.stringify({ runId: forwardInfo.runId, timeoutMs: 6000 }),
+                    JSON.stringify({ runId: forwardInfo.runId, timeoutMs: COORD_AGENT_WAIT_MS }),
                     '--json',
                   ],
-                  { timeoutMs: 9000 }
+                  { timeoutMs: COORD_AGENT_WAIT_CMD_MS }
                 )
 
                 const waitPayload = parseGatewayJson(waitResult.stdout)
@@ -478,6 +593,111 @@ export async function POST(request: NextRequest) {
                 )
               }
             }
+          }
+
+          // Regular agent conversations (agent_<name> format from the chat panel):
+          // Run agent.wait in a background task so the 201 response is returned
+          // immediately.  This path only fires when forwardInfo.runId is set, which
+          // only happens for the agentId-only (no live session) invocation path that
+          // uses deliver:false.  The sessionKey path uses deliver:true and relies on
+          // gateway chat.message events instead — forwardInfo.runId is NOT set there.
+          if (
+            typeof conversation_id === 'string' &&
+            !conversation_id.startsWith('coord:') &&
+            forwardInfo.delivered &&
+            forwardInfo.runId &&
+            typeof to === 'string'
+          ) {
+            // Capture everything the background task needs before the request
+            // scope is cleaned up.
+            const bgConvId    = conversation_id
+            const bgTo        = to
+            const bgFrom      = from
+            const bgRunId     = forwardInfo.runId
+            const bgWsId      = workspaceId
+            const bgDb        = getDatabase()
+
+            // Fire-and-forget: do NOT await so the HTTP response returns now.
+            ;(async () => {
+              logger.debug({ runId: bgRunId, to: bgTo }, '[chat] agent.wait background task started')
+              try {
+                const waitResult = await runOpenClaw(
+                  [
+                    'gateway',
+                    'call',
+                    'agent.wait',
+                    '--timeout',
+                    String(AGENT_WAIT_CMD_MS - 1000),
+                    '--params',
+                    JSON.stringify({ runId: bgRunId, timeoutMs: AGENT_WAIT_MS }),
+                    '--json',
+                  ],
+                  { timeoutMs: AGENT_WAIT_CMD_MS }
+                )
+
+                const waitPayload = parseGatewayJson(waitResult.stdout)
+                const waitStatus  = String(waitPayload?.status || '').toLowerCase()
+
+                if (waitStatus === 'error') {
+                  const reason = typeof waitPayload?.error === 'string'
+                    ? waitPayload.error
+                    : 'Unknown runtime error'
+                  createChatReply(
+                    bgDb, bgWsId, bgConvId, bgTo, bgFrom,
+                    `I could not complete your request: ${reason}`,
+                    'status',
+                    { status: 'error', runId: bgRunId }
+                  )
+                } else if (waitStatus === 'timeout') {
+                  createChatReply(
+                    bgDb, bgWsId, bgConvId, bgTo, bgFrom,
+                    'Your request is still being processed. I will post the result when execution completes.',
+                    'status',
+                    { status: 'processing', runId: bgRunId }
+                  )
+                } else {
+                  const replyText = extractReplyText(waitPayload)
+                  if (replyText) {
+                    createChatReply(
+                      bgDb, bgWsId, bgConvId, bgTo, bgFrom,
+                      replyText,
+                      'text',
+                      { status: waitStatus || 'completed', runId: bgRunId }
+                    )
+                  }
+                }
+              } catch (waitErr) {
+                // agent.wait itself threw (process error, unexpected exit, etc.).
+                // Parse stdout in case there is a usable response payload buried
+                // in the error (OpenClaw sometimes writes JSON before dying).
+                const maybeStdout  = String((waitErr as any)?.stdout || '')
+                const waitPayload  = parseGatewayJson(maybeStdout)
+                const waitStatus   = String(waitPayload?.status || '').toLowerCase()
+
+                if (waitStatus === 'timeout') {
+                  createChatReply(
+                    bgDb, bgWsId, bgConvId, bgTo, bgFrom,
+                    'Your request is still being processed. I will post the result when execution completes.',
+                    'status',
+                    { status: 'processing', runId: bgRunId }
+                  )
+                } else {
+                  const replyText = extractReplyText(waitPayload)
+                  if (replyText) {
+                    createChatReply(
+                      bgDb, bgWsId, bgConvId, bgTo, bgFrom,
+                      replyText, 'text',
+                      { status: waitStatus || 'completed', runId: bgRunId }
+                    )
+                  } else {
+                    logger.debug(
+                      { runId: bgRunId, err: waitErr },
+                      '[chat] agent.wait failed; no usable payload returned'
+                    )
+                  }
+                }
+              }
+            })()
           }
         }
       }

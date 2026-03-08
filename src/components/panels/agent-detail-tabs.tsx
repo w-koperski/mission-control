@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
+import { useMissionControl } from '@/store'
 import { createClientLogger } from '@/lib/client-logger'
+import { getModelByAlias } from '@/lib/models'
 import Link from 'next/link'
 
 const log = createClientLogger('AgentDetailTabs')
@@ -821,9 +823,9 @@ const MODEL_TIER_LABELS: Record<string, string> = {
 }
 
 const DEFAULT_MODEL_BY_TIER: Record<'opus' | 'sonnet' | 'haiku', string> = {
-  opus: 'anthropic/claude-opus-4-5',
-  sonnet: 'anthropic/claude-sonnet-4-20250514',
-  haiku: 'anthropic/claude-haiku-4-5',
+  opus:   getModelByAlias('opus')?.name   ?? 'anthropic/claude-opus-4-5',
+  sonnet: getModelByAlias('sonnet')?.name ?? 'anthropic/claude-sonnet-4-20250514',
+  haiku:  getModelByAlias('haiku')?.name  ?? 'anthropic/claude-haiku-4-5',
 }
 
 // Enhanced Create Agent Modal with Template Wizard
@@ -842,9 +844,9 @@ export function CreateAgentModal({
   onClose: () => void
   onCreated: () => void
 }) {
+  const { availableModels } = useMissionControl()
   const [step, setStep] = useState<1 | 2 | 3>(1)
   const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null)
-  const [availableModels, setAvailableModels] = useState<AvailableModel[]>([])
   const [customModelInput, setCustomModelInput] = useState(false)
   const [formData, setFormData] = useState({
     name: '',
@@ -870,35 +872,6 @@ export function CreateAgentModal({
     const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
     setFormData(prev => ({ ...prev, name, id }))
   }
-
-  useEffect(() => {
-    const loadAvailableModels = async () => {
-      try {
-        const response = await fetch('/api/status?action=models')
-        if (!response.ok) return
-        const data = await response.json()
-        const models = Array.isArray(data.models) ? data.models : []
-        const seen = new Set<string>()
-        const parsed = models
-          .map((model: any) => ({
-            name: String(model.name || model.alias || '').trim(),
-            alias: String(model.alias || '').trim(),
-            provider: String(model.provider || 'other').trim(),
-            description: String(model.description || '').trim(),
-            costPer1k: typeof model.costPer1k === 'number' ? model.costPer1k : 0,
-          }))
-          .filter((m: AvailableModel) => {
-            if (!m.name || seen.has(m.name)) return false
-            seen.add(m.name)
-            return true
-          })
-        setAvailableModels(parsed)
-      } catch {
-        // Keep modal usable without model suggestions.
-      }
-    }
-    loadAvailableModels()
-  }, [])
 
   // When template is selected, pre-fill form
   const selectTemplate = (type: string | null) => {
@@ -1334,13 +1307,13 @@ export function ConfigTab({
   agent: Agent & { config?: any }
   onSave: () => void
 }) {
+  const { availableModels } = useMissionControl()
   const [config, setConfig] = useState<any>(agent.config || {})
   const [editing, setEditing] = useState(false)
   const [showJson, setShowJson] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [jsonInput, setJsonInput] = useState('')
-  const [availableModels, setAvailableModels] = useState<string[]>([])
   const [newFallbackModel, setNewFallbackModel] = useState('')
   const [newAllowTool, setNewAllowTool] = useState('')
   const [newDenyTool, setNewDenyTool] = useState('')
@@ -1350,23 +1323,15 @@ export function ConfigTab({
     setJsonInput(JSON.stringify(agent.config || {}, null, 2))
   }, [agent.config])
 
-  useEffect(() => {
-    const loadAvailableModels = async () => {
-      try {
-        const response = await fetch('/api/status?action=models')
-        if (!response.ok) return
-        const data = await response.json()
-        const models = Array.isArray(data.models) ? data.models : []
-        const names = models
-          .map((model: any) => String(model.name || model.alias || '').trim())
-          .filter(Boolean)
-        setAvailableModels(Array.from(new Set<string>(names)))
-      } catch {
-        // Ignore model suggestions if unavailable.
-      }
-    }
-    loadAvailableModels()
-  }, [])
+  const configSortedProviders = useMemo(
+    () => Array.from(new Set(availableModels.map(m => m.provider))).sort(),
+    [availableModels]
+  )
+
+  const availableModelNames = useMemo(
+    () => new Set(availableModels.map(m => m.name)),
+    [availableModels]
+  )
 
   const updateModelConfig = (updater: (current: { primary?: string; fallbacks?: string[] }) => { primary?: string; fallbacks?: string[] }) => {
     setConfig((prev: any) => {
@@ -1535,34 +1500,52 @@ export function ConfigTab({
               <div className="space-y-3">
                 <div>
                   <label className="block text-xs text-muted-foreground mb-1">Primary model</label>
-                  <input
+                  <select
                     value={modelPrimary}
                     onChange={(e) => updateModelConfig((current) => ({ ...current, primary: e.target.value }))}
-                    list="agent-model-suggestions"
-                    placeholder="anthropic/claude-sonnet-4-20250514"
                     className="w-full bg-surface-1 text-foreground rounded px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
-                  />
-                  <datalist id="agent-model-suggestions">
-                    {availableModels.map((name) => (
-                      <option key={name} value={name} />
+                  >
+                    {modelPrimary && !availableModelNames.has(modelPrimary) && (
+                      <option value={modelPrimary}>{modelPrimary}</option>
+                    )}
+                    {configSortedProviders.map(provider => (
+                      <optgroup key={provider} label={provider.charAt(0).toUpperCase() + provider.slice(1)}>
+                        {availableModels.filter(m => m.provider === provider).map(m => (
+                          <option key={m.name} value={m.name}>
+                            {m.alias !== m.name ? `${m.alias} — ` : ''}{m.name}
+                          </option>
+                        ))}
+                      </optgroup>
                     ))}
-                  </datalist>
+                  </select>
                 </div>
                 <div>
                   <label className="block text-xs text-muted-foreground mb-1">Fallback models</label>
                   <div className="space-y-2">
                     {modelFallbacks.map((fallback: string, index: number) => (
                       <div key={`${fallback}-${index}`} className="flex gap-2">
-                        <input
+                        <select
                           value={fallback}
                           onChange={(e) => {
                             const next = [...modelFallbacks]
                             next[index] = e.target.value
                             updateModelConfig((current) => ({ ...current, fallbacks: next }))
                           }}
-                          list="agent-model-suggestions"
                           className="flex-1 bg-surface-1 text-foreground rounded px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
-                        />
+                        >
+                          {fallback && !availableModelNames.has(fallback) && (
+                            <option value={fallback}>{fallback}</option>
+                          )}
+                          {configSortedProviders.map(provider => (
+                            <optgroup key={provider} label={provider.charAt(0).toUpperCase() + provider.slice(1)}>
+                              {availableModels.filter(m => m.provider === provider).map(m => (
+                                <option key={m.name} value={m.name}>
+                                  {m.alias !== m.name ? `${m.alias} — ` : ''}{m.name}
+                                </option>
+                              ))}
+                            </optgroup>
+                          ))}
+                        </select>
                         <button
                           onClick={() => {
                             const next = modelFallbacks.filter((_: string, i: number) => i !== index)
@@ -1575,16 +1558,26 @@ export function ConfigTab({
                       </div>
                     ))}
                     <div className="flex gap-2">
-                      <input
+                      <select
                         value={newFallbackModel}
                         onChange={(e) => setNewFallbackModel(e.target.value)}
-                        list="agent-model-suggestions"
-                        placeholder="Add fallback model"
                         className="flex-1 bg-surface-1 text-foreground rounded px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
-                      />
+                      >
+                        <option value="">Add fallback model…</option>
+                        {configSortedProviders.map(provider => (
+                          <optgroup key={provider} label={provider.charAt(0).toUpperCase() + provider.slice(1)}>
+                            {availableModels.filter(m => m.provider === provider).map(m => (
+                              <option key={m.name} value={m.name}>
+                                {m.alias !== m.name ? `${m.alias} — ` : ''}{m.name}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
                       <button
                         onClick={addFallbackModel}
-                        className="px-3 py-2 text-xs bg-secondary text-foreground rounded hover:bg-surface-2 transition-smooth"
+                        disabled={!newFallbackModel}
+                        className="px-3 py-2 text-xs bg-secondary text-foreground rounded hover:bg-surface-2 transition-smooth disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         Add
                       </button>

@@ -12,8 +12,31 @@ import {
 } from '@/lib/device-identity'
 import { APP_VERSION } from '@/lib/version'
 import { createClientLogger } from '@/lib/client-logger'
+import { isHumanAgent } from '@/lib/agent-names'
 
 const log = createClientLogger('WebSocket')
+
+/**
+ * Normalize the conversation_id coming from an OpenClaw gateway chat.message
+ * event so it matches the Mission Control UI format ("agent_<name>").
+ *
+ * OpenClaw uses session-key format ("agent:name:type") for conversation IDs.
+ * When it's absent or in that format we derive the UI-format ID from from_agent.
+ */
+function normalizeChatConversationId(payload: any): string {
+  const cid = payload?.conversation_id
+  if (cid) {
+    // Convert "agent:name:type" → "agent_name"
+    const m = String(cid).match(/^agent:([^:]+):/)
+    if (m) return `agent_${m[1]}`
+    return String(cid)
+  }
+  // Fallback: derive from the sender when conversation_id is absent
+  if (payload?.from_agent && payload.from_agent !== 'human' && payload.from_agent !== 'system') {
+    return `agent_${payload.from_agent}`
+  }
+  return `conv_${Date.now()}`
+}
 
 // Gateway protocol version (v3 required by OpenClaw 2026.x)
 const PROTOCOL_VERSION = 3
@@ -195,7 +218,7 @@ export function useWebSocket() {
     const cachedToken = getCachedDeviceToken()
 
     const clientId = DEFAULT_GATEWAY_CLIENT_ID
-    const clientMode = 'ui'
+    const clientMode = 'webchat'
     const role = 'operator'
     const scopes = ['operator.admin']
     const authToken = authTokenRef.current || undefined
@@ -477,7 +500,7 @@ export function useWebSocket() {
         if (msg) {
           addChatMessage({
             id: msg.id,
-            conversation_id: msg.conversation_id,
+            conversation_id: normalizeChatConversationId(msg),
             from_agent: msg.from_agent,
             to_agent: msg.to_agent,
             content: msg.content,
@@ -486,6 +509,19 @@ export function useWebSocket() {
             read_at: msg.read_at,
             created_at: msg.created_at || Math.floor(Date.now() / 1000),
           })
+
+          // Persist agent-originated messages to the server DB so they survive
+          // page reloads and appear in the comms panel.  Fire-and-forget — the
+          // endpoint deduplicates by gateway message id, so retries are safe.
+          // (In proxy mode this is handled server-side by gateway-proxy.ts instead.)
+          if (msg.from_agent && !isHumanAgent(msg.from_agent)) {
+            fetch('/api/chat/messages/ingest', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(msg),
+              credentials: 'same-origin',
+            }).catch(() => { /* best-effort; failures are logged server-side */ })
+          }
         }
       } else if (frame.event === 'notification') {
         // Real-time notification from gateway
@@ -607,7 +643,7 @@ export function useWebSocket() {
       }
 
       ws.onclose = (event) => {
-        log.info(`Disconnected from Gateway: ${event.code} ${event.reason}`)
+        log.info(`Disconnected from Gateway: ${event.code} ${event.reason || '(no reason)'}`)
         setConnection({ isConnected: false })
         handshakeCompleteRef.current = false
         stopHeartbeat()
@@ -618,6 +654,14 @@ export function useWebSocket() {
         if (nonRetryableErrorRef.current) {
           setConnection({ reconnectAttempts: 0 })
           return
+        }
+
+        // For normal closures (code 1000) the remote ended the session cleanly
+        // and is expected to accept a new connection immediately.  Reset the
+        // attempt counter so exponential backoff starts from zero again instead
+        // of accumulating toward maxReconnectAttempts.
+        if (event.code === 1000) {
+          reconnectAttemptsRef.current = 0
         }
 
         // Auto-reconnect with exponential backoff (uses connectRef to avoid stale closure)
@@ -645,8 +689,19 @@ export function useWebSocket() {
       }
 
       ws.onerror = (error) => {
-        log.error('WebSocket error:', error)
-        const errorMessage = 'WebSocket error occurred'
+        const RS_LABELS: Record<number, string> = {
+          [WebSocket.CONNECTING]: 'CONNECTING',
+          [WebSocket.OPEN]: 'OPEN',
+          [WebSocket.CLOSING]: 'CLOSING',
+          [WebSocket.CLOSED]: 'CLOSED',
+        }
+        const stateLabel = RS_LABELS[ws.readyState] ?? 'UNKNOWN'
+        log.error('WebSocket error:', {
+          url: normalizedUrl.split('?')[0],
+          readyState: stateLabel,
+          eventType: (error as any)?.type || 'error',
+        })
+        const errorMessage = `WebSocket error (${stateLabel}) on ${normalizedUrl.split('?')[0]}`
         if (!shouldSuppressWebSocketError(errorMessage)) {
           addLog({
             id: `error-${Date.now()}`,

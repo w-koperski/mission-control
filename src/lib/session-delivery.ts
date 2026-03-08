@@ -1,20 +1,20 @@
-import { runClawdbot, runOpenClaw } from './command'
+import { runOpenClaw } from './command'
 
 /**
- * Try to deliver a session message via clawdbot and openclaw gateway in parallel.
- * Returns null on success or when session delivery is not supported on this
- * installation, or a non-empty error string if both methods genuinely fail.
+ * Deliver a session message via the openclaw gateway.
  *
- * Both methods are fired simultaneously.  The first to succeed resolves null.
- * If the gateway immediately reports a definitive "not supported" error
- * ("unknown method" or "unknown command"), we resolve null immediately —
- * session delivery is simply not available on this installation, which is a
- * normal, expected state that should not generate a warning in callers.
+ * Uses the documented OpenClaw API:
+ *   openclaw gateway call sessions.send --params '{"session":"<key>","message":"<text>"}'
+ *
+ * Returns null on success or when session delivery is not supported on this
+ * installation (gateway not running / "unknown method" / "unknown command").
+ * Returns a non-empty error string only when the gateway is reachable but
+ * the call definitively fails.
  *
  * Typical timings:
- *  - Success via either method:        < 500 ms
+ *  - Success:                          < 500 ms
  *  - Gateway "unknown method" (no-op): < 500 ms (short-circuit, resolves null)
- *  - Both genuinely unavailable:       bounded by timeoutMs (both time out)
+ *  - Timeout / unreachable:            bounded by timeoutMs
  */
 export function sendSessionMessage(
   sessionKey: string,
@@ -23,60 +23,19 @@ export function sendSessionMessage(
 ): Promise<string | null> {
   const payload = JSON.stringify({ session: sessionKey, message })
 
-  return new Promise<string | null>((resolve) => {
-    let done = false
-    const finish = (result: string | null) => {
-      if (!done) {
-        done = true
-        resolve(result)
+  return runOpenClaw(
+    ['gateway', 'call', 'sessions.send', '--params', payload],
+    { timeoutMs }
+  )
+    .then(() => null)
+    .catch((e: any): string | null => {
+      const detail = String(e?.stderr || e?.message || 'session delivery failed')
+      // If the gateway definitively does not support this method, treat it as
+      // a silent no-op — session delivery is simply not available on this
+      // installation, which is an expected state.
+      if (detail.includes('unknown method') || detail.includes('unknown command')) {
+        return null
       }
-    }
-
-    let cbError: string | null = null
-    let cbDone = false
-    let gwError: string | null = null
-    let gwDone = false
-
-    const checkBothFailed = () => {
-      if (cbDone && gwDone) {
-        // At least one must have an error for us to reach here (otherwise
-        // finish(null) would have been called on success).
-        finish(
-          [cbError, gwError].filter(Boolean).join('; ') ||
-          'session delivery failed'
-        )
-      }
-    }
-
-    // clawdbot attempt
-    runClawdbot(['sessions_send', sessionKey, message], { timeoutMs })
-      .then(() => finish(null))
-      .catch((e: any) => {
-        cbError = String(e?.message || 'clawdbot failed')
-        cbDone = true
-        checkBothFailed()
-      })
-
-    // Gateway RPC attempt
-    runOpenClaw(
-      ['gateway', 'call', 'sessions.send', '--params', payload],
-      { timeoutMs }
-    )
-      .then(() => finish(null))
-      .catch((e: any) => {
-        const detail = String(e?.stderr || e?.message || 'gateway failed')
-        gwError = detail
-        gwDone = true
-        // If gateway gives a definitive "not supported" error, session delivery
-        // is simply not available on this installation — this is a normal,
-        // expected state, not a failure.  Resolve null immediately so callers
-        // do not emit spurious warnings.  The clawdbot process continues in the
-        // background and will be killed by its own timeout.
-        if (detail.includes('unknown method') || detail.includes('unknown command')) {
-          finish(null)
-          return
-        }
-        checkBothFailed()
-      })
-  })
+      return detail
+    })
 }
