@@ -53,6 +53,14 @@ export function persistGatewayMessage(payload: any, workspaceId = 1): void {
     // Use json_extract to safely query the JSON metadata column — avoids
     // treating % and _ in the id as SQL LIKE wildcards.
     const gatewayId = payload.id ? String(payload.id) : null
+
+    if (!gatewayId) {
+      // Helpful debug for operators: missing gateway message IDs mean
+      // deduplication cannot be applied and multiple delivery paths may
+      // produce duplicate messages.
+      logger.debug({ from: fromAgent, conversationId }, '[gateway-message-persist] Incoming message missing gateway id; deduplication unavailable')
+    }
+
     if (gatewayId) {
       const existing = db
         .prepare(

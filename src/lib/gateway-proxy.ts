@@ -115,6 +115,12 @@ class GatewayProxyManager extends EventEmitter {
         '[gateway-proxy] OPENCLAW_GATEWAY_HOST is set to a bind-wildcard address. ' +
         'This works but is not recommended for outbound connections; prefer 127.0.0.1.',
       )
+      // In production, escalate the problem to an error-level log so operators
+      // don't miss the configuration issue. We still attempt the connection to
+      // avoid surprising behavior, but this log will be prominent in production.
+      if (process.env.NODE_ENV === 'production') {
+        logger.error({ host }, '[gateway-proxy] Bind-wildcard OPENCLAW_GATEWAY_HOST detected in production. Set OPENCLAW_GATEWAY_HOST=127.0.0.1 to avoid connection issues.')
+      }
     }
     const url = buildGatewayWsUrl(host, config.gatewayPort)
     logger.info({ url }, '[gateway-proxy] Connecting to gateway')
